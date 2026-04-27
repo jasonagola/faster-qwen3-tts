@@ -6,13 +6,14 @@ CUDA graphs for 6-10x speedup.
 """
 import logging
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, Iterable, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
 import torch
 
 from .utils import suppress_flash_attn_warning
+from .text_delta import StreamingTextTokenCommitter
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +214,10 @@ class FasterQwen3TTS:
         encode silence instead, preventing that phoneme from bleeding into the start
         of the generated speech. Set silence_secs=0 to disable this behavior.
         """
-        audio, sr = sf.read(str(ref_audio), dtype="float32", always_2d=False)
+        if hasattr(self.model, "_load_audio_to_np"):
+            audio, sr = self.model._load_audio_to_np(str(ref_audio))
+        else:
+            audio, sr = sf.read(str(ref_audio), dtype="float32", always_2d=False)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)  # convert to mono
         if silence_secs > 0:
@@ -508,6 +512,313 @@ class FasterQwen3TTS:
         talker.rope_deltas = None
 
         return m, talker, config, tie, tam, tth, tpe
+
+    def _tokenize_assistant_content(self, text: str) -> List[int]:
+        input_id = self.model._tokenize_texts([self.model._build_assistant_text(text)])[0]
+        return [int(x) for x in input_id[:, 3:-5].squeeze(0).detach().cpu().tolist()]
+
+    def _assistant_role_ids(self) -> torch.Tensor:
+        return self.model._tokenize_texts([self.model._build_assistant_text("")])[0][:, :3]
+
+    def _iter_text_delta_token_ids(
+        self,
+        text_deltas: Iterable[str],
+        token_holdback: int,
+    ) -> Iterator[int]:
+        deltas = [text_deltas] if isinstance(text_deltas, str) else text_deltas
+        committer = StreamingTextTokenCommitter(
+            tokenize_content=self._tokenize_assistant_content,
+            token_holdback=token_holdback,
+        )
+        for delta in deltas:
+            for token_id in committer.push(delta):
+                yield token_id
+        for token_id in committer.flush():
+            yield token_id
+
+    def _prepare_text_delta_stream_prompt(
+        self,
+        *,
+        m,
+        first_text_token_id: int,
+        role_ids: torch.Tensor,
+        instruct_id: Optional[torch.Tensor],
+        language: str,
+        speaker: Optional[str] = None,
+        speaker_embedding: Optional[torch.Tensor] = None,
+        ref_id: Optional[torch.Tensor] = None,
+        ref_code: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        if speaker_embedding is not None:
+            speaker_embed = speaker_embedding.to(m.talker.device).to(m.talker.dtype)
+        elif speaker == "" or speaker is None:
+            speaker_embed = None
+        else:
+            if speaker.lower() not in m.config.talker_config.spk_id:
+                raise NotImplementedError(f"Speaker {speaker} not implemented")
+            spk_id = m.config.talker_config.spk_id[speaker.lower()]
+            speaker_embed = m.talker.get_input_embeddings()(
+                torch.tensor(spk_id, device=m.talker.device, dtype=role_ids.dtype)
+            )
+
+        if language.lower() == "auto":
+            language_id = None
+        else:
+            if language.lower() not in m.config.talker_config.codec_language_id:
+                raise NotImplementedError(f"Language {language} not implemented")
+            language_id = m.config.talker_config.codec_language_id[language.lower()]
+
+        if (
+            language.lower() in ["chinese", "auto"]
+            and speaker not in ("", None)
+            and m.config.talker_config.spk_is_dialect[speaker.lower()]
+        ):
+            dialect = m.config.talker_config.spk_is_dialect[speaker.lower()]
+            language_id = m.config.talker_config.codec_language_id[dialect]
+
+        role_ids = role_ids.to(m.talker.device)
+        first_text_token = torch.tensor(
+            [[int(first_text_token_id)]],
+            device=m.talker.device,
+            dtype=role_ids.dtype,
+        )
+
+        prompt_parts = []
+        if instruct_id is not None:
+            prompt_parts.append(
+                m.talker.text_projection(
+                    m.talker.get_text_embeddings()(instruct_id.to(m.talker.device))
+                )
+            )
+
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = m.talker.text_projection(
+            m.talker.get_text_embeddings()(
+                torch.tensor(
+                    [[m.config.tts_bos_token_id, m.config.tts_eos_token_id, m.config.tts_pad_token_id]],
+                    device=m.talker.device,
+                    dtype=role_ids.dtype,
+                )
+            )
+        ).chunk(3, dim=1)
+
+        if language_id is None:
+            codec_prefill_list = [[
+                m.config.talker_config.codec_nothink_id,
+                m.config.talker_config.codec_think_bos_id,
+                m.config.talker_config.codec_think_eos_id,
+            ]]
+        else:
+            codec_prefill_list = [[
+                m.config.talker_config.codec_think_id,
+                m.config.talker_config.codec_think_bos_id,
+                language_id,
+                m.config.talker_config.codec_think_eos_id,
+            ]]
+
+        codec_input_embedding_0 = m.talker.get_input_embeddings()(
+            torch.tensor(codec_prefill_list, device=m.talker.device, dtype=role_ids.dtype)
+        )
+        codec_input_embedding_1 = m.talker.get_input_embeddings()(
+            torch.tensor(
+                [[m.config.talker_config.codec_pad_id, m.config.talker_config.codec_bos_id]],
+                device=m.talker.device,
+                dtype=role_ids.dtype,
+            )
+        )
+        if speaker_embed is None:
+            codec_input_embedding = torch.cat([codec_input_embedding_0, codec_input_embedding_1], dim=1)
+        else:
+            codec_input_embedding = torch.cat(
+                [codec_input_embedding_0, speaker_embed.view(1, 1, -1), codec_input_embedding_1],
+                dim=1,
+            )
+
+        role_embed = m.talker.text_projection(m.talker.get_text_embeddings()(role_ids))
+        codec_prefill_embed = torch.cat(
+            (
+                tts_pad_embed.expand(-1, codec_input_embedding.shape[1] - 2, -1),
+                tts_bos_embed,
+            ),
+            dim=1,
+        ) + codec_input_embedding[:, :-1]
+
+        prompt_parts.extend([role_embed, codec_prefill_embed])
+        initial_text_hiddens: List[torch.Tensor] = []
+
+        if ref_code is not None:
+            if ref_id is None:
+                raise ValueError("ref_text/ref_id is required for ICL text-delta streaming.")
+
+            ref_text_id = ref_id.to(m.talker.device)[:, 3:-2]
+            seed_text_id = torch.cat([ref_text_id, first_text_token], dim=-1)
+            seed_text_embed = m.talker.text_projection(m.talker.get_text_embeddings()(seed_text_id))
+
+            ref_code = ref_code.to(m.talker.device).clone()
+            ref_codec_embeds = []
+            for i in range(m.talker.config.num_code_groups):
+                if i == 0:
+                    ref_codec_embeds.append(m.talker.get_input_embeddings()(ref_code[:, :1]))
+                else:
+                    ref_codec_embeds.append(m.talker.code_predictor.get_input_embeddings()[i - 1](ref_code[:, i:i+1]))
+            ref_codec_embed = torch.cat(ref_codec_embeds, dim=1).sum(1).unsqueeze(0)
+            ref_codec_embed = torch.cat(
+                [
+                    m.talker.get_input_embeddings()(
+                        torch.tensor(
+                            [[m.config.talker_config.codec_bos_id]],
+                            device=m.talker.device,
+                            dtype=role_ids.dtype,
+                        )
+                    ),
+                    ref_codec_embed,
+                ],
+                dim=1,
+            )
+
+            codec_lens = ref_codec_embed.shape[1]
+            if seed_text_embed.shape[1] > codec_lens:
+                prompt_parts.append(seed_text_embed[:, :codec_lens] + ref_codec_embed)
+                pending_text = seed_text_embed[:, codec_lens:]
+                initial_text_hiddens = [pending_text[:, i:i+1] for i in range(pending_text.shape[1])]
+            else:
+                if seed_text_embed.shape[1] < codec_lens:
+                    seed_text_embed = torch.cat(
+                        [
+                            seed_text_embed,
+                            tts_pad_embed.expand(-1, codec_lens - seed_text_embed.shape[1], -1),
+                        ],
+                        dim=1,
+                    )
+                prompt_parts.append(seed_text_embed + ref_codec_embed)
+        else:
+            first_text_embed = (
+                m.talker.text_projection(m.talker.get_text_embeddings()(first_text_token))
+                + codec_input_embedding[:, -1:]
+            )
+            prompt_parts.append(first_text_embed)
+
+        return torch.cat(prompt_parts, dim=1), tts_eos_embed, tts_pad_embed, initial_text_hiddens
+
+    def _prepare_text_delta_generation(
+        self,
+        *,
+        text_deltas: Iterable[str],
+        language: str,
+        token_holdback: int,
+        speaker: Optional[str] = None,
+        speaker_embedding: Optional[torch.Tensor] = None,
+        instruct: Optional[str] = None,
+        ref_id: Optional[torch.Tensor] = None,
+        ref_code: Optional[torch.Tensor] = None,
+    ):
+        token_iter = iter(self._iter_text_delta_token_ids(text_deltas, token_holdback))
+        try:
+            first_text_token_id = next(token_iter)
+        except StopIteration as exc:
+            raise ValueError("text_deltas produced no text tokens.") from exc
+
+        instruct_id = None
+        if instruct:
+            instruct_id = self.model._tokenize_texts([self.model._build_instruct_text(instruct)])[0]
+
+        m = self.model.model
+        role_ids = self._assistant_role_ids()
+        tie, tts_eos_embed, tpe, initial_text_hiddens = self._prepare_text_delta_stream_prompt(
+            m=m,
+            first_text_token_id=first_text_token_id,
+            role_ids=role_ids,
+            instruct_id=instruct_id,
+            language=language,
+            speaker=speaker,
+            speaker_embedding=speaker_embedding,
+            ref_id=ref_id,
+            ref_code=ref_code,
+        )
+        tam = torch.ones((1, tie.shape[1]), device=tie.device, dtype=torch.long)
+
+        if not self._warmed_up:
+            self._warmup(tie.shape[1])
+
+        talker = m.talker
+        config = m.config.talker_config
+        talker.rope_deltas = None
+
+        def text_hiddens() -> Iterator[torch.Tensor]:
+            yield from initial_text_hiddens
+            for token_id in token_iter:
+                token = torch.tensor(
+                    [[int(token_id)]],
+                    device=m.talker.device,
+                    dtype=role_ids.dtype,
+                )
+                yield m.talker.text_projection(m.talker.get_text_embeddings()(token))
+
+        return m, talker, config, tie, tam, text_hiddens(), tts_eos_embed, tpe
+
+    def _stream_audio_from_text_delta_codes(
+        self,
+        *,
+        codec_stream,
+        speech_tokenizer,
+        chunk_size: int,
+        ref_codes: Optional[torch.Tensor] = None,
+        context_frames: int = 25,
+    ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
+        min_calibration_frames = max(context_frames, chunk_size)
+        all_codes = []
+        prev_gen_audio_len = 0
+        samples_per_frame = None
+
+        for codec_chunk, timing in codec_stream:
+            all_codes.append(codec_chunk)
+            n_new = codec_chunk.shape[0]
+            all_flat = torch.cat(all_codes, dim=0)
+            n_total = all_flat.shape[0]
+
+            if samples_per_frame is None:
+                if ref_codes is not None:
+                    codes_input = torch.cat([ref_codes.to(all_flat.device), all_flat], dim=0)
+                else:
+                    codes_input = all_flat
+                audio_list, sr = speech_tokenizer.decode({"audio_codes": codes_input.unsqueeze(0)})
+                audio = audio_list[0]
+                if hasattr(audio, "cpu"):
+                    audio = audio.flatten().cpu().numpy()
+                else:
+                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
+
+                if ref_codes is not None:
+                    ref_len = ref_codes.shape[0]
+                    total_len = codes_input.shape[0]
+                    ref_audio_cut = int(ref_len / max(total_len, 1) * len(audio))
+                    gen_audio = audio[ref_audio_cut:]
+                else:
+                    gen_audio = audio
+
+                new_audio = gen_audio[prev_gen_audio_len:]
+                prev_gen_audio_len = len(gen_audio)
+
+                if n_total >= min_calibration_frames:
+                    samples_per_frame = len(gen_audio) / n_total
+            else:
+                ctx_start = max(0, n_total - n_new - context_frames)
+                window = all_flat[ctx_start:]
+                n_ctx = window.shape[0] - n_new
+
+                audio_list, sr = speech_tokenizer.decode({"audio_codes": window.unsqueeze(0)})
+                audio = audio_list[0]
+                if hasattr(audio, "cpu"):
+                    audio = audio.flatten().cpu().numpy()
+                else:
+                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
+
+                if n_ctx > 0:
+                    ctx_samples = int(round(n_ctx * samples_per_frame))
+                    new_audio = audio[ctx_samples:]
+                else:
+                    new_audio = audio
+
+            yield new_audio, sr, timing
 
     def _build_talker_inputs_local(
         self,
@@ -1036,6 +1347,211 @@ class FasterQwen3TTS:
                     new_audio = audio
 
             yield new_audio, sr, timing
+
+    @torch.inference_mode()
+    def stream_voice_clone_from_text_deltas(
+        self,
+        text_deltas: Iterable[str],
+        language: str,
+        ref_audio: Optional[Union[str, Path]] = None,
+        ref_text: str = "",
+        max_new_tokens: int = 2048,
+        min_new_tokens: int = 2,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.05,
+        chunk_size: int = 12,
+        token_holdback: int = 1,
+        xvec_only: bool = False,
+        append_silence: bool = True,
+        instruct: Optional[str] = None,
+        voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
+    ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
+        """Stream Base voice-clone speech from upstream text deltas.
+
+        This is text-input streaming: callers pass partial target text from an
+        upstream LLM. It is distinct from ``generate_voice_clone_streaming``,
+        which streams audio output after a complete target text is already known.
+        """
+        if self.model.model.tts_model_type != "base":
+            raise ValueError("Loaded model does not support voice clone generation")
+
+        self.model._validate_languages([language])
+        from .streaming import fast_generate_text_delta_streaming
+
+        role_ids = self._assistant_role_ids()
+        vcp, ref_ids, using_icl_mode = self._resolve_voice_clone_prompt(
+            input_ids=[role_ids],
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            xvec_only=xvec_only,
+            append_silence=append_silence,
+            voice_clone_prompt=voice_clone_prompt,
+        )
+        speaker_embedding = vcp["ref_spk_embedding"][0]
+        ref_codes = None
+        ref_id = None
+        if using_icl_mode and vcp.get("ref_code") and vcp["ref_code"][0] is not None:
+            ref_codes = vcp["ref_code"][0]
+            ref_id = ref_ids[0]
+            if ref_id is None:
+                raise ValueError("ref_text is required for ICL text-delta streaming.")
+
+        m, talker, config, tie, tam, text_hiddens, tts_eos_embed, tpe = self._prepare_text_delta_generation(
+            text_deltas=text_deltas,
+            language=language,
+            token_holdback=token_holdback,
+            speaker_embedding=speaker_embedding,
+            instruct=instruct,
+            ref_id=ref_id,
+            ref_code=ref_codes,
+        )
+
+        codec_stream = fast_generate_text_delta_streaming(
+            talker=talker,
+            talker_input_embeds=tie,
+            attention_mask=tam,
+            text_hiddens=text_hiddens,
+            tts_eos_embed=tts_eos_embed,
+            tts_pad_embed=tpe,
+            config=config,
+            predictor_graph=self.predictor_graph,
+            talker_graph=self.talker_graph,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            chunk_size=chunk_size,
+        )
+        yield from self._stream_audio_from_text_delta_codes(
+            codec_stream=codec_stream,
+            speech_tokenizer=m.speech_tokenizer,
+            chunk_size=chunk_size,
+            ref_codes=ref_codes,
+        )
+
+    @torch.inference_mode()
+    def stream_custom_voice_from_text_deltas(
+        self,
+        text_deltas: Iterable[str],
+        speaker: str,
+        language: str,
+        instruct: Optional[str] = None,
+        max_new_tokens: int = 2048,
+        min_new_tokens: int = 2,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.05,
+        chunk_size: int = 12,
+        token_holdback: int = 1,
+    ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
+        """Stream CustomVoice speech from upstream text deltas."""
+        if self.model.model.tts_model_type != "custom_voice":
+            raise ValueError("Loaded model does not support custom voice generation")
+
+        self.model._validate_languages([language])
+        self.model._validate_speakers([speaker])
+
+        if self.model.model.tts_model_size in "0b6":
+            instruct = None
+
+        from .streaming import fast_generate_text_delta_streaming
+
+        m, talker, config, tie, tam, text_hiddens, tts_eos_embed, tpe = self._prepare_text_delta_generation(
+            text_deltas=text_deltas,
+            language=language,
+            token_holdback=token_holdback,
+            speaker=speaker,
+            instruct=instruct,
+        )
+
+        codec_stream = fast_generate_text_delta_streaming(
+            talker=talker,
+            talker_input_embeds=tie,
+            attention_mask=tam,
+            text_hiddens=text_hiddens,
+            tts_eos_embed=tts_eos_embed,
+            tts_pad_embed=tpe,
+            config=config,
+            predictor_graph=self.predictor_graph,
+            talker_graph=self.talker_graph,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            chunk_size=chunk_size,
+        )
+        yield from self._stream_audio_from_text_delta_codes(
+            codec_stream=codec_stream,
+            speech_tokenizer=m.speech_tokenizer,
+            chunk_size=chunk_size,
+        )
+
+    @torch.inference_mode()
+    def stream_voice_design_from_text_deltas(
+        self,
+        text_deltas: Iterable[str],
+        instruct: str,
+        language: str,
+        max_new_tokens: int = 2048,
+        min_new_tokens: int = 2,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.05,
+        chunk_size: int = 12,
+        token_holdback: int = 1,
+    ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
+        """Stream VoiceDesign speech from upstream text deltas."""
+        if self.model.model.tts_model_type != "voice_design":
+            raise ValueError("Loaded model does not support voice design generation")
+
+        self.model._validate_languages([language])
+        from .streaming import fast_generate_text_delta_streaming
+
+        m, talker, config, tie, tam, text_hiddens, tts_eos_embed, tpe = self._prepare_text_delta_generation(
+            text_deltas=text_deltas,
+            language=language,
+            token_holdback=token_holdback,
+            speaker=None,
+            instruct=instruct,
+        )
+
+        codec_stream = fast_generate_text_delta_streaming(
+            talker=talker,
+            talker_input_embeds=tie,
+            attention_mask=tam,
+            text_hiddens=text_hiddens,
+            tts_eos_embed=tts_eos_embed,
+            tts_pad_embed=tpe,
+            config=config,
+            predictor_graph=self.predictor_graph,
+            talker_graph=self.talker_graph,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            chunk_size=chunk_size,
+        )
+        yield from self._stream_audio_from_text_delta_codes(
+            codec_stream=codec_stream,
+            speech_tokenizer=m.speech_tokenizer,
+            chunk_size=chunk_size,
+        )
 
     @torch.inference_mode()
     def generate_custom_voice(

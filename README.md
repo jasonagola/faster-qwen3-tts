@@ -233,6 +233,57 @@ The CUDA graphs are unchanged — both predictor and talker graphs are replayed 
 
 The Python streaming methods are pull-based generators: they prepare the next chunk when the caller requests it. For realtime local playback, use a queue-backed player such as `StreamPlayer`; blocking after each yielded chunk prevents generation and playback from overlapping.
 
+### Text-delta input streaming
+
+The `generate_*_streaming` methods stream audio out of TTS after the full text prompt is already known. The `stream_*_from_text_deltas` methods stream text into TTS while an upstream LLM is still producing the prompt. This is the front-side streaming path: it is designed to reduce time from "LLM starts answering" to "first playable TTS audio".
+
+```python
+text_deltas = ["Hello", ", this is ", "streaming input."]
+
+for audio_chunk, sr, timing in model.stream_custom_voice_from_text_deltas(
+    text_deltas=text_deltas,
+    speaker="aiden",
+    language="English",
+    chunk_size=8,
+):
+    play(audio_chunk, sr)
+```
+
+Available methods:
+
+- `stream_custom_voice_from_text_deltas(...)`
+- `stream_voice_design_from_text_deltas(...)`
+- `stream_voice_clone_from_text_deltas(...)`
+
+The input committer retokenizes the accumulated text with the same assistant wrapper used by normal generation, commits stable content tokens, and holds back the final token by default (`token_holdback=1`) to avoid unstable BPE boundaries. When the input iterator ends, the remaining text tokens and the TTS EOS token are flushed.
+
+To compare full-text output streaming against text-delta input streaming:
+
+```bash
+python benchmarks/compare_text_delta_input.py \
+  --engines faster \
+  --modes custom_voice voice_clone_xvec voice_clone_icl voice_design \
+  --multipliers 1 2 3 4 \
+  --llm-tokens-per-second 28 \
+  --tokens-per-delta 4
+```
+
+To run a live OpenAI-to-TTS latency test, set `OPENAI_API_KEY` and run:
+
+```bash
+python benchmarks/openai_text_delta_latency.py \
+  --openai-model gpt-5.4-mini \
+  --engines upstream faster \
+  --modes custom_voice \
+  --output-limits 100 200 500 1000 \
+  --max-seq-len 8192 \
+  --max-new-tokens 4096 \
+  --chunk-size 8 \
+  --write-wavs
+```
+
+This warms the TTS path first, then opens a fresh streamed OpenAI request for each engine/mode/token limit and feeds the deltas directly into the TTS generator as they arrive. The same completed text is then used for the full-text baseline, whose timeline starts only after the OpenAI stream finishes. Add `--no-tts-warmup` if you want first-use model setup and CUDA graph capture included in the request timing.
+
 ## Voice Cloning Quality
 
 ### Cloning modes

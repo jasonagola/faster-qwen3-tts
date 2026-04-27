@@ -41,7 +41,6 @@ import json
 import logging
 import os
 import queue
-import re
 import struct
 import sys
 import threading
@@ -207,35 +206,6 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
         yield _to_pcm16(item)
 
 
-_SENTENCE_BOUNDARY_RE = re.compile(r'[.!?]["\')\]]*(?=\s|$)')
-
-
-def _pop_ready_text_segment(buffer: str, *, final: bool = False) -> tuple[str | None, str]:
-    """Return a stable sentence-sized segment, preserving remaining text."""
-    text = buffer.strip()
-    if not text:
-        return None, ""
-    if final:
-        return text, ""
-
-    sentence_match = _SENTENCE_BOUNDARY_RE.search(buffer)
-    if sentence_match:
-        end = sentence_match.end()
-        return buffer[:end].strip(), buffer[end:].lstrip()
-
-    soft_limit = 180
-    target = 140
-    if len(buffer) >= soft_limit:
-        split_at = max(buffer.rfind(",", 0, target), buffer.rfind(";", 0, target))
-        if split_at < 80:
-            split_at = buffer.rfind(" ", 0, target)
-        if split_at < 80:
-            split_at = target
-        return buffer[:split_at].strip(), buffer[split_at:].lstrip()
-
-    return None, buffer
-
-
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -333,30 +303,49 @@ async def create_speech_from_deltas(websocket: WebSocket):
         await websocket.close(code=1003)
         return
 
-    segment_queue: queue.Queue = queue.Queue()
+    delta_queue: queue.Queue = queue.Queue()
     audio_queue: queue.Queue = queue.Queue()
     _DONE = object()
     cancelled = False
 
+    def seed_generation():
+        seed = start.get("seed", os.environ.get("QWEN_TTS_SEED"))
+        if seed is None or seed == "":
+            return
+        seed_int = int(seed)
+        torch.manual_seed(seed_int)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed_int)
+
+    def delta_iter():
+        seen_text = False
+        idle_space_sent = False
+        while True:
+            try:
+                item = delta_queue.get(timeout=0.25)
+            except queue.Empty:
+                if seen_text and not idle_space_sent:
+                    idle_space_sent = True
+                    yield " "
+                continue
+            if item is _DONE:
+                break
+            seen_text = True
+            idle_space_sent = False
+            yield str(item)
+
     def produce_audio():
         try:
-            while True:
-                item = segment_queue.get()
-                if item is _DONE:
-                    break
-                text = str(item).strip()
-                if not text:
-                    continue
-                with _model_lock:
-                    for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
-                        text=text,
-                        language=voice_cfg.get("language", "Auto"),
-                        ref_audio=voice_cfg["ref_audio"],
-                        ref_text=voice_cfg.get("ref_text", ""),
-                        chunk_size=voice_cfg.get("chunk_size", 12),
-                        non_streaming_mode=False,
-                    ):
-                        audio_queue.put(chunk)
+            seed_generation()
+            with _model_lock:
+                for chunk, _sr, _timing in tts_model.stream_voice_clone_from_text_deltas(
+                    text_deltas=delta_iter(),
+                    language=voice_cfg.get("language", "Auto"),
+                    ref_audio=voice_cfg["ref_audio"],
+                    ref_text=voice_cfg.get("ref_text", ""),
+                    chunk_size=voice_cfg.get("chunk_size", 12),
+                ):
+                    audio_queue.put(chunk)
         except Exception as exc:
             audio_queue.put(exc)
         finally:
@@ -364,7 +353,6 @@ async def create_speech_from_deltas(websocket: WebSocket):
 
     async def read_deltas():
         nonlocal cancelled
-        pending_text = ""
         try:
             while True:
                 message = await websocket.receive_json()
@@ -372,29 +360,21 @@ async def create_speech_from_deltas(websocket: WebSocket):
                 if event_type == "delta":
                     text = str(message.get("text") or "")
                     if text:
-                        pending_text += text
-                        while True:
-                            segment, pending_text = _pop_ready_text_segment(pending_text)
-                            if not segment:
-                                break
-                            segment_queue.put(segment)
+                        delta_queue.put(text)
                     continue
                 if event_type == "done":
-                    segment, pending_text = _pop_ready_text_segment(pending_text, final=True)
-                    if segment:
-                        segment_queue.put(segment)
-                    segment_queue.put(_DONE)
+                    delta_queue.put(_DONE)
                     return
                 if event_type == "cancel":
                     cancelled = True
-                    segment_queue.put(_DONE)
+                    delta_queue.put(_DONE)
                     return
         except WebSocketDisconnect:
             cancelled = True
-            segment_queue.put(_DONE)
+            delta_queue.put(_DONE)
         except Exception:
             cancelled = True
-            segment_queue.put(_DONE)
+            delta_queue.put(_DONE)
 
     loop = asyncio.get_event_loop()
     reader_task = asyncio.create_task(read_deltas())
@@ -408,11 +388,13 @@ async def create_speech_from_deltas(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": str(item)})
                 break
             await websocket.send_bytes(_to_pcm16(item))
+        if not reader_task.done():
+            await reader_task
         if not cancelled:
             await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
         cancelled = True
-        segment_queue.put(_DONE)
+        delta_queue.put(_DONE)
     except Exception as exc:
         await websocket.send_json({"type": "error", "message": str(exc)})
     finally:
@@ -424,7 +406,7 @@ async def create_speech_from_deltas(websocket: WebSocket):
                 pass
             except Exception:
                 pass
-        segment_queue.put(_DONE)
+        delta_queue.put(_DONE)
         await producer_future
 
 
