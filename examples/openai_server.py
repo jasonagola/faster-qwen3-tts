@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import queue
+import re
 import struct
 import sys
 import threading
@@ -49,7 +50,7 @@ from typing import AsyncGenerator, Optional
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -206,6 +207,35 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
         yield _to_pcm16(item)
 
 
+_SENTENCE_BOUNDARY_RE = re.compile(r'[.!?]["\')\]]*(?=\s|$)')
+
+
+def _pop_ready_text_segment(buffer: str, *, final: bool = False) -> tuple[str | None, str]:
+    """Return a stable sentence-sized segment, preserving remaining text."""
+    text = buffer.strip()
+    if not text:
+        return None, ""
+    if final:
+        return text, ""
+
+    sentence_match = _SENTENCE_BOUNDARY_RE.search(buffer)
+    if sentence_match:
+        end = sentence_match.end()
+        return buffer[:end].strip(), buffer[end:].lstrip()
+
+    soft_limit = 180
+    target = 140
+    if len(buffer) >= soft_limit:
+        split_at = max(buffer.rfind(",", 0, target), buffer.rfind(";", 0, target))
+        if split_at < 80:
+            split_at = buffer.rfind(" ", 0, target)
+        if split_at < 80:
+            split_at = target
+        return buffer[:split_at].strip(), buffer[split_at:].lstrip()
+
+    return None, buffer
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -213,7 +243,12 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model_loaded": tts_model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": tts_model is not None,
+        "text_delta_streaming": True,
+        "text_delta_stream_endpoint": "/v1/audio/speech/deltas",
+    }
 
 
 @app.post("/v1/audio/speech")
@@ -263,6 +298,134 @@ async def create_speech(req: SpeechRequest):
             yield raw_chunk
 
     return StreamingResponse(audio_stream(), media_type=content_type)
+
+
+@app.websocket("/v1/audio/speech/deltas")
+async def create_speech_from_deltas(websocket: WebSocket):
+    await websocket.accept()
+    if tts_model is None:
+        await websocket.send_json({"type": "error", "message": "Model not loaded"})
+        await websocket.close(code=1011)
+        return
+
+    try:
+        start = await websocket.receive_json()
+    except Exception:
+        await websocket.send_json({"type": "error", "message": "Expected start message"})
+        await websocket.close(code=1003)
+        return
+
+    if str(start.get("type") or "start") != "start":
+        await websocket.send_json({"type": "error", "message": "First message must be type=start"})
+        await websocket.close(code=1003)
+        return
+
+    fmt = str(start.get("response_format") or "pcm").lower()
+    if fmt != "pcm":
+        await websocket.send_json({"type": "error", "message": "Text-delta streaming only supports pcm"})
+        await websocket.close(code=1003)
+        return
+
+    try:
+        voice_cfg = resolve_voice(str(start.get("voice") or "alloy"))
+    except HTTPException as exc:
+        await websocket.send_json({"type": "error", "message": str(exc.detail)})
+        await websocket.close(code=1003)
+        return
+
+    segment_queue: queue.Queue = queue.Queue()
+    audio_queue: queue.Queue = queue.Queue()
+    _DONE = object()
+    cancelled = False
+
+    def produce_audio():
+        try:
+            while True:
+                item = segment_queue.get()
+                if item is _DONE:
+                    break
+                text = str(item).strip()
+                if not text:
+                    continue
+                with _model_lock:
+                    for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
+                        text=text,
+                        language=voice_cfg.get("language", "Auto"),
+                        ref_audio=voice_cfg["ref_audio"],
+                        ref_text=voice_cfg.get("ref_text", ""),
+                        chunk_size=voice_cfg.get("chunk_size", 12),
+                        non_streaming_mode=False,
+                    ):
+                        audio_queue.put(chunk)
+        except Exception as exc:
+            audio_queue.put(exc)
+        finally:
+            audio_queue.put(_DONE)
+
+    async def read_deltas():
+        nonlocal cancelled
+        pending_text = ""
+        try:
+            while True:
+                message = await websocket.receive_json()
+                event_type = str(message.get("type") or "")
+                if event_type == "delta":
+                    text = str(message.get("text") or "")
+                    if text:
+                        pending_text += text
+                        while True:
+                            segment, pending_text = _pop_ready_text_segment(pending_text)
+                            if not segment:
+                                break
+                            segment_queue.put(segment)
+                    continue
+                if event_type == "done":
+                    segment, pending_text = _pop_ready_text_segment(pending_text, final=True)
+                    if segment:
+                        segment_queue.put(segment)
+                    segment_queue.put(_DONE)
+                    return
+                if event_type == "cancel":
+                    cancelled = True
+                    segment_queue.put(_DONE)
+                    return
+        except WebSocketDisconnect:
+            cancelled = True
+            segment_queue.put(_DONE)
+        except Exception:
+            cancelled = True
+            segment_queue.put(_DONE)
+
+    loop = asyncio.get_event_loop()
+    reader_task = asyncio.create_task(read_deltas())
+    producer_future = loop.run_in_executor(None, produce_audio)
+    try:
+        while True:
+            item = await loop.run_in_executor(None, audio_queue.get)
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                await websocket.send_json({"type": "error", "message": str(item)})
+                break
+            await websocket.send_bytes(_to_pcm16(item))
+        if not cancelled:
+            await websocket.send_json({"type": "done"})
+    except WebSocketDisconnect:
+        cancelled = True
+        segment_queue.put(_DONE)
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+    finally:
+        if not reader_task.done():
+            reader_task.cancel()
+            try:
+                await reader_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        segment_queue.put(_DONE)
+        await producer_future
 
 
 # ---------------------------------------------------------------------------
