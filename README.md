@@ -112,6 +112,74 @@ The vanilla full-text path uses stock `Qwen3TTSModel.generate_voice_clone(...)`,
 
 Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-Base`, voice clone x-vector mode, prepared Wimbledon text, `o200k_base` tokenizer prefixes, simulated LLM rate 30 tokens/sec, `chunk_size=8`, `token_holdback` values `1` and `8`, `do_sample=True`, `temperature=0.9`, `top_k=50`, `top_p=1.0`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. Model load and warmup are excluded.
 
+### Benchmark Source Text
+
+The 100, 200, and 500 token targets are prefixes of this same source text after `o200k_base` tokenization.
+
+<details>
+<summary>Show source text</summary>
+
+```text
+Wimbledon has always balanced ritual with reinvention. The white clothing, the
+clipped grass, and the careful silence before a serve still make the tournament
+feel tied to another age, yet the tennis itself has changed dramatically. Wooden
+rackets rewarded touch, timing, and quick approaches to the net. Graphite
+rackets brought more power, more spin, and a baseline game that can stretch a
+rally from corner to corner. Serve and volley once defined grass court instinct,
+but modern players defend, slide, recover, and counter with athletic patterns
+shaped by sports science.
+
+The courts changed too, not by abandoning grass, but by making it more durable,
+more even, and more compatible with longer rallies. The old surface could be
+slick and uneven by the second week, with bad bounces that pushed players
+toward quick points. Modern maintenance has made the bounce truer and the game
+less chaotic. A player can still attack, but the reward now comes from choosing
+the right moment rather than charging forward because the surface demands it.
+
+Equipment changed the sound and rhythm of the tournament. A wooden racket made
+every strike feel like a negotiation. The sweet spot was small, and a mistimed
+swing could turn courage into embarrassment. Graphite widened the margin for
+violence. Players could swing harder, brush the ball with heavier topspin, and
+still land it near the baseline. That technology did not remove skill; it moved
+skill into new places, toward acceleration, recovery, disguise, and the ability
+to repeat explosive movement for hours.
+
+The athletes changed with the tools. Training teams became larger and more
+specialized. Fitness coaches, physiotherapists, nutritionists, analysts, and
+stringers now shape the performance that appears on court. The best players are
+not only shot makers; they are systems for solving pressure. They prepare for
+patterns, study tendencies, manage hydration, and adjust rackets for weather
+that the crowd may barely notice. The old mythology of tennis as a solitary
+duel still matters, but the modern champion stands at the visible edge of a
+large invisible operation.
+
+Technology changed the argument around fairness. Hawk Eye did not eliminate
+disagreement, but it changed the emotional contract between player, official,
+and spectator. The old line-call drama had a human texture, and sometimes a
+human injustice. Review systems made the game feel more precise, more
+accountable, and less dependent on one instant of eyesight. Roofed courts
+changed another old tension. Rain delays once bent the shape of entire draws.
+Now the tournament can preserve its schedule while still carrying the mood of
+English weather just outside the lights.
+
+Money and media changed the meaning of Wimbledon beyond the grounds. Prize
+money made professional tennis more viable for more players, while global
+coverage turned a local ritual into a worldwide appointment. A point played on
+Centre Court can be clipped, argued about, and studied everywhere before the
+players have left their chairs. That visibility raises pressure, but it also
+preserves moments that would once have lived only in memory.
+
+For all of that change, Wimbledon still works because it lets the old and new
+press against each other. The tournament looks backward through its ceremonies
+and forward through the speed of the ball. It asks modern athletes to perform
+inside an old frame, and that tension gives the event its force. The grass is
+still grass. The silence before serve is still silence. But the problem placed
+before each player is faster, stronger, more technical, and more public than it
+used to be.
+```
+
+</details>
+
 🟩 means at least 1s saved, 🟨 means 0.25-1s saved, and ⬜ means under 0.25s saved.
 
 ### Normalized Timeline
