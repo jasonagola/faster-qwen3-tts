@@ -3,6 +3,11 @@ sample_*.wav
 *.wav
 !ref_audio.wav
 *.json
+*.csv
 __pycache__/
 *.pyc
 .venv/
+.env
+openai_live_torture*/
+openai_text_delta_latency/
+qwen3_compare_text_delta*/

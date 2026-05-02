@@ -6,7 +6,7 @@ Yields codec ID chunks during generation instead of collecting all at once.
 CUDA graph usage is identical to non-streaming — same per-step performance.
 """
 import time
-from typing import Generator, Tuple
+from typing import Generator, Iterable, Tuple
 
 import torch
 
@@ -186,6 +186,202 @@ def fast_generate_streaming(
             'total_steps_so_far': total_steps,
             'is_final': True,
         }
+
+
+@torch.inference_mode()
+def fast_generate_text_delta_streaming(
+    talker,
+    talker_input_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    text_hiddens: Iterable[torch.Tensor],
+    tts_eos_embed: torch.Tensor,
+    tts_pad_embed: torch.Tensor,
+    config,
+    predictor_graph: PredictorGraph,
+    talker_graph: TalkerGraph,
+    max_new_tokens: int = 2048,
+    min_new_tokens: int = 2,
+    temperature: float = 0.9,
+    top_k: int = 50,
+    top_p: float = 1.0,
+    do_sample: bool = True,
+    repetition_penalty: float = 1.05,
+    chunk_size: int = 12,
+    max_tail_tokens: int = 64,
+) -> Generator[Tuple[torch.Tensor, dict], None, None]:
+    """CUDA-graph generation driven by upstream text-token deltas.
+
+    ``talker_input_embeds`` must contain the prompt through the first committed
+    text token. ``text_hiddens`` supplies later committed target-text hiddens as
+    they become available. After that iterable is exhausted, the loop feeds TTS
+    EOS once and then TTS PAD until codec EOS or ``max_new_tokens``.
+    """
+    eos_id = config.codec_eos_token_id
+    vocab_size = config.vocab_size
+    device = talker_input_embeds.device
+
+    suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+    suppress_start = max(0, vocab_size - 1024)
+    for i in range(suppress_start, vocab_size):
+        if i != eos_id:
+            suppress_mask[i] = True
+
+    predictor = talker.code_predictor
+    talker_codec_embed = talker.get_input_embeddings()
+    talker_codec_head = talker.codec_head
+    predictor_codec_embeds = predictor.get_input_embeddings()
+    num_code_groups = config.num_code_groups
+
+    t_start = time.time()
+    out = talker.forward(
+        inputs_embeds=talker_input_embeds,
+        attention_mask=attention_mask,
+        use_cache=True,
+        output_hidden_states=True,
+        return_dict=True,
+        trailing_text_hidden=tts_pad_embed,
+        tts_pad_embed=tts_pad_embed,
+        generation_step=None,
+        past_hidden=None,
+        past_key_values=None,
+    )
+
+    talker_past_kv = out.past_key_values
+    past_hidden = out.past_hidden
+    gen_step = out.generation_step
+
+    logits = out.logits[:, -1, :]
+    suppress_eos = min_new_tokens > 0
+    token = sample_logits(
+        logits,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        do_sample=do_sample,
+        suppress_mask=suppress_mask,
+        suppress_tokens=[eos_id] if suppress_eos else None,
+    )
+
+    prefill_len = talker_graph.prefill_kv(talker_past_kv)
+    rope_deltas = getattr(talker, "rope_deltas", None)
+    talker_graph.set_generation_state(attention_mask, rope_deltas)
+
+    torch.cuda.synchronize()
+    t_prefill = time.time() - t_start
+
+    chunk_buffer = []
+    all_first_tokens = []
+    total_steps = 0
+    chunk_count = 0
+    chunk_start = time.time()
+    done = False
+
+    def emit_chunk(is_final: bool):
+        nonlocal chunk_buffer, chunk_count, chunk_start, total_steps
+        if not chunk_buffer:
+            return None
+
+        torch.cuda.synchronize()
+        chunk_decode_time = time.time() - chunk_start
+        total_steps += len(chunk_buffer)
+        payload = (
+            torch.stack(chunk_buffer),
+            {
+                "chunk_index": chunk_count,
+                "chunk_steps": len(chunk_buffer),
+                "prefill_ms": t_prefill * 1000 if chunk_count == 0 else 0,
+                "decode_ms": chunk_decode_time * 1000,
+                "total_steps_so_far": total_steps,
+                "is_final": is_final,
+            },
+        )
+        chunk_buffer = []
+        chunk_count += 1
+        chunk_start = time.time()
+        return payload
+
+    def generate_one(text_hidden: torch.Tensor, *, allow_eos: bool) -> bool:
+        nonlocal token, past_hidden, gen_step, done
+
+        if done or len(all_first_tokens) >= max_new_tokens:
+            done = True
+            return True
+        if token.item() == eos_id:
+            done = True
+            return True
+
+        last_id_hidden = talker_codec_embed(token.unsqueeze(1))
+        pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
+        codebook_token_ids = predictor_graph.run(pred_input)
+
+        all_cb = torch.cat([token.view(1), codebook_token_ids])
+        chunk_buffer.append(all_cb.detach())
+        all_first_tokens.append(token.detach())
+
+        codec_hiddens = [last_id_hidden]
+        for i in range(num_code_groups - 1):
+            codec_hiddens.append(predictor_codec_embeds[i](codebook_token_ids[i].unsqueeze(0).unsqueeze(0)))
+        inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)
+        inputs_embeds = inputs_embeds + text_hidden
+
+        current_pos = prefill_len + len(all_first_tokens) - 1
+        if current_pos >= talker_graph.max_seq_len - 1:
+            done = True
+            return True
+
+        hidden_states = talker_graph.run(inputs_embeds, position=current_pos)
+        logits = talker_codec_head(hidden_states[:, -1, :]).unsqueeze(0)
+
+        if repetition_penalty != 1.0 and all_first_tokens:
+            history = torch.stack(all_first_tokens)
+            logits = apply_repetition_penalty(logits, history, repetition_penalty)
+
+        suppress_eos = (not allow_eos) or len(all_first_tokens) < min_new_tokens
+        token = sample_logits(
+            logits.squeeze(0),
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            suppress_mask=suppress_mask,
+            suppress_tokens=[eos_id] if suppress_eos else None,
+        )
+        past_hidden = hidden_states[:, -1:, :].clone()
+        gen_step += 1
+        return False
+
+    for text_hidden in text_hiddens:
+        done = generate_one(text_hidden, allow_eos=False)
+        if len(chunk_buffer) >= chunk_size:
+            emitted = emit_chunk(is_final=False)
+            if emitted is not None:
+                yield emitted
+        if done:
+            break
+
+    tail_tokens = 0
+    if not done:
+        done = generate_one(tts_eos_embed, allow_eos=True)
+        tail_tokens += 1
+        if len(chunk_buffer) >= chunk_size:
+            emitted = emit_chunk(is_final=False)
+            if emitted is not None:
+                yield emitted
+
+    while not done and tail_tokens < max_tail_tokens:
+        done = generate_one(tts_pad_embed, allow_eos=True)
+        tail_tokens += 1
+        if len(chunk_buffer) >= chunk_size:
+            emitted = emit_chunk(is_final=False)
+            if emitted is not None:
+                yield emitted
+
+    if not done and tail_tokens >= max_tail_tokens:
+        done = True
+
+    emitted = emit_chunk(is_final=True)
+    if emitted is not None:
+        yield emitted
 
 
 @torch.inference_mode()

@@ -233,6 +233,32 @@ The CUDA graphs are unchanged — both predictor and talker graphs are replayed 
 
 The Python streaming methods are pull-based generators: they prepare the next chunk when the caller requests it. For realtime local playback, use a queue-backed player such as `StreamPlayer`; blocking after each yielded chunk prevents generation and playback from overlapping.
 
+### Text-delta input streaming
+
+The `generate_*_streaming` methods stream audio out of TTS after the full text prompt is already known. The `stream_*_from_text_deltas` methods stream text into TTS while an upstream LLM is still producing the prompt. This is the front-side streaming path: it is designed to reduce time from "LLM starts answering" to "first playable TTS audio".
+
+```python
+text_deltas = ["Hello", ", this is ", "streaming input."]
+
+for audio_chunk, sr, timing in model.stream_custom_voice_from_text_deltas(
+    text_deltas=text_deltas,
+    speaker="aiden",
+    language="English",
+    chunk_size=8,
+):
+    play(audio_chunk, sr)
+```
+
+Available methods:
+
+- `stream_custom_voice_from_text_deltas(...)`
+- `stream_voice_design_from_text_deltas(...)`
+- `stream_voice_clone_from_text_deltas(...)`
+
+The input committer retokenizes the accumulated text with the same assistant wrapper used by normal generation, commits stable content tokens, and holds back the final token by default (`token_holdback=1`) to avoid unstable BPE boundaries. Set `token_holdback=0` for the most aggressive latency, or increase it to keep more local text lookahead before feeding TTS. When the input iterator ends, the remaining text tokens and the TTS EOS token are flushed.
+
+This V1 API is Python-only. Server/WebSocket protocols can adapt to it by passing incoming text chunks as `text_deltas`, but no server wire protocol is added here. For real-model validation, run a small GPU smoke test that verifies the text-delta API yields multiple nonempty audio chunks and that the existing full-text streaming APIs still work.
+
 ## Voice Cloning Quality
 
 ### Cloning modes
