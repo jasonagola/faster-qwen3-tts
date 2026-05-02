@@ -95,7 +95,7 @@ Full-text generation remains best when maximum prosody and future sentence conte
 
 ## Benchmark: Normalized LLM-to-TTS Timeline
 
-This benchmark uses prepared local text and replays exactly 100, 200, and 500 text deltas at 30 tokens/sec. There is no live LLM call in this benchmark. Every downstream TTS number is normalized to the first prepared text token:
+This benchmark uses one prepared Wimbledon text, slices the first 100, 200, and 500 `o200k_base` tokenizer tokens from it, and replays those token-sized text deltas at 30 tokens/sec. There is no live LLM call in this benchmark. Every downstream TTS number is normalized to the first prepared text token:
 
 ```text
 first prepared text token == T+0.000s
@@ -108,9 +108,9 @@ That makes the comparison specific to what a user feels after an LLM starts answ
 - **faster-qwen3-tts:** full text in, CUDA graph first streamed audio chunk out.
 - **This fork:** text deltas in, CUDA graph first streamed audio chunk out.
 
-The vanilla full-text path uses stock `Qwen3TTSModel.generate_voice_clone(...)`, which returns complete audio rather than yielding a first audio chunk, so the benchmark reports **audio-ready time** for that path. Rows with a TTS `max_new_tokens` cap are excluded; all rows below completed without hitting the cap.
+The vanilla full-text path uses stock `Qwen3TTSModel.generate_voice_clone(...)`, which returns complete audio rather than yielding a first audio chunk, so the benchmark reports **audio-ready time** for that path. Rows with a TTS `max_new_tokens` cap are excluded; all rows below completed without hitting the cap. Earlier no-sampling runs could hit the cap on the 500-token prefix and produce misleading multi-minute rows, so the README benchmark uses the model's normal sampling path.
 
-Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-Base`, voice clone x-vector mode, prepared Wimbledon text, simulated LLM rate 30 tokens/sec, `chunk_size=8`, `token_holdback=1`, `do_sample=False`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. Model load and warmup are excluded.
+Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-Base`, voice clone x-vector mode, prepared Wimbledon text, `o200k_base` tokenizer prefixes, simulated LLM rate 30 tokens/sec, `chunk_size=8`, `token_holdback` values `1` and `8`, `do_sample=True`, `temperature=0.9`, `top_k=50`, `top_p=1.0`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. Model load and warmup are excluded.
 
 🟩 means at least 1s saved, 🟨 means 0.25-1s saved, and ⬜ means under 0.25s saved.
 
@@ -118,40 +118,43 @@ Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.
 
 `T+0.000s` is the first prepared stream token. Columns are ordered from fastest expected first audio to slowest baseline.
 
-| Target | This repo: Faster + text-delta first audio | LLM done | Faster full-text first audio | Qwen3-TTS-streaming first audio | Vanilla Qwen full-text audio ready |
-|---:|---:|---:|---:|---:|---:|
-| 100 tokens | T+0.287s | T+3.300s | T+3.580s | T+3.777s | T+24.971s |
-| 200 tokens | T+0.271s | T+6.633s | T+6.895s | T+7.082s | T+49.851s |
-| 500 tokens | T+0.270s | T+16.633s | T+16.901s | T+17.074s | T+235.474s |
+| Target | This repo: Faster + text-delta hb=1 first audio | This repo: Faster + text-delta hb=8 first audio | LLM done | Faster full-text first audio | Qwen3-TTS-streaming first audio | Vanilla Qwen full-text audio ready |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 tokens | T+0.358s | T+0.576s | T+3.300s | T+3.572s | T+3.754s | T+20.940s |
+| 200 tokens | T+0.341s | T+0.575s | T+6.633s | T+6.892s | T+7.081s | T+38.763s |
+| 500 tokens | T+0.348s | T+0.575s | T+16.633s | T+16.893s | T+17.065s | T+101.676s |
 
 ### Improvement Breakdown
 
-| Target | Backend audio streaming: Qwen streaming vs vanilla | CUDA graph gain: Faster vs Qwen streaming | Front-side gain: text-delta vs Faster full-text | Total gain: this repo vs vanilla |
-|---:|---:|---:|---:|---:|
-| 100 tokens | 🟩 21.195s | ⬜ 0.197s | 🟩 3.293s | 🟩 24.685s (87.01x) |
-| 200 tokens | 🟩 42.769s | ⬜ 0.186s | 🟩 6.624s | 🟩 49.580s (183.95x) |
-| 500 tokens | 🟩 218.399s | ⬜ 0.174s | 🟩 16.631s | 🟩 235.203s (872.13x) |
+| Target | Backend audio streaming: Qwen streaming vs vanilla | CUDA graph gain: Faster vs Qwen streaming | Front-side gain hb=1 vs Faster full-text | Front-side gain hb=8 vs Faster full-text | Total gain hb=1 vs vanilla | Total gain hb=8 vs vanilla |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 tokens | 🟩 17.186s | ⬜ 0.182s | 🟩 3.214s | 🟩 2.997s | 🟩 20.581s (58.49x) | 🟩 20.364s (36.35x) |
+| 200 tokens | 🟩 31.683s | ⬜ 0.189s | 🟩 6.551s | 🟩 6.317s | 🟩 38.422s (113.67x) | 🟩 38.188s (67.41x) |
+| 500 tokens | 🟩 84.610s | ⬜ 0.172s | 🟩 16.545s | 🟩 16.318s | 🟩 101.327s (292.17x) | 🟩 101.101s (176.83x) |
 
-In this run, this fork's text-delta first audio stayed around `T+0.27s` after the first text token. Qwen3-TTS-streaming removes the wait for complete audio by exposing back-side audio chunks. faster-qwen3-tts then trims the full-text streaming path with CUDA graph capture. This fork removes the remaining front-side wait for the full LLM response.
+In this run, this fork's text-delta first audio stayed around `T+0.34-0.36s` with `token_holdback=1` and around `T+0.58s` with `token_holdback=8`. Qwen3-TTS-streaming removes the wait for complete audio by exposing back-side audio chunks. faster-qwen3-tts then trims the full-text streaming path with CUDA graph capture. This fork removes the remaining front-side wait for the full LLM response.
 
 ## Reproduce The Benchmark
 
 ```bash
 git clone https://github.com/QwenLM/Qwen3-TTS.git ../Qwen3-TTS-vanilla
 git clone https://github.com/rekuenkdr/Qwen3-TTS-streaming.git ../Qwen3-TTS-streaming
+python -m pip install tiktoken
 
 python benchmarks/text_delta_normalized_benchmark.py \
   --targets 100 200 500 \
   --simulated-tokens-per-second 30 \
+  --delta-tokenizer openai-o200k \
   --chunk-size 8 \
   --token-holdback 1 \
+  --text-delta-token-holdbacks 1 8 \
   --max-new-tokens 4096 \
-  --no-sample \
+  --do-sample \
   --vanilla-repo ../Qwen3-TTS-vanilla \
   --streaming-repo ../Qwen3-TTS-streaming
 ```
 
-The script writes normalized CSV summaries, prepared text recordings, and a README-ready Markdown table under the ignored `text_delta_normalized_benchmark/` directory. Add `--write-wavs` if you also want generated WAVs for each measured path.
+The script writes normalized CSV summaries, prepared text recordings, and a README-ready Markdown table under the ignored `text_delta_normalized_benchmark/` directory. The `openai-o200k` tokenizer option requires `tiktoken`; use `--delta-tokenizer qwen` to slice the same source text with the Qwen tokenizer instead. Add `--write-wavs` if you also want generated WAVs for each measured path.
 
 ## Text-Delta Samples
 
