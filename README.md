@@ -259,8 +259,8 @@ Available methods:
 
 | API | Input | Output | Notes |
 |---|---|---|---|
-| `generate_*_streaming(...)` | Complete text string | Qwen TTS audio chunks | Existing faster-qwen3-tts audio-output streaming path. |
-| `stream_*_from_text_deltas(...)` | Iterable of partial text chunks | Qwen TTS audio chunks | New Python API for LLM-style text-delta input. |
+| `generate_*_streaming(...)` | Complete text string | Qwen TTS audio chunks | Full-text input path. Audio can stream out, but TTS waits until all text is available. |
+| `stream_*_from_text_deltas(...)` | Iterable of partial text chunks | Qwen TTS audio chunks | Text-delta input path. TTS can begin while the upstream LLM is still writing. |
 | OpenAI [`/v1/audio/speech`](https://platform.openai.com/docs/api-reference/audio/createSpeech) | Complete `input` text | Audio response / streamed audio bytes | Standard speech API pattern: text is already complete before TTS starts. |
 | OpenAI [Responses streaming](https://platform.openai.com/docs/guides/streaming) | Prompt/messages | Text deltas such as [`response.output_text.delta`](https://platform.openai.com/docs/api-reference/responses-streaming/response/output_text/delta) | LLM text streaming pattern; this fork bridges those deltas into Qwen TTS. |
 
@@ -276,15 +276,22 @@ Full-text generation remains best when maximum prosody and future sentence conte
 
 #### Live input-streaming benchmark
 
-These numbers measure a real OpenAI Responses stream feeding `stream_custom_voice_from_text_deltas(...)` directly, compared with waiting for the same OpenAI response to finish before calling `generate_custom_voice_streaming(...)`. Rows with a TTS `max_new_tokens` cap are excluded; all rows below completed without hitting the cap.
+These numbers isolate the benefit of text-delta input streaming. Both paths use the same TTS model, same audio-output streaming path, same speaker, same generation settings, and the same OpenAI-generated text. The only difference is when TTS is allowed to start:
 
-Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, speaker `Ryan`, `gpt-5.4-mini`, `chunk_size=8`, `token_holdback=1`, `do_sample=True`, `temperature=0.9`, `top_k=50`, `top_p=1.0`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. The TTS model was warmed before request timing, so model load and CUDA graph capture are excluded from the request timeline.
+- Full-text path: wait for the LLM response to finish, then call `generate_custom_voice_streaming(...)`.
+- Text-delta path: feed OpenAI `response.output_text.delta` chunks directly into `stream_custom_voice_from_text_deltas(...)`.
 
-| OpenAI target | OpenAI first token | OpenAI done | First audio from text deltas | Full-text first audio | First-token-to-audio | Audio before LLM done |
+The full-text path still streams audio once TTS starts. The performance gain below comes from removing the full-text wait before TTS can begin. Rows with a TTS `max_new_tokens` cap are excluded; all rows below completed without hitting the cap.
+
+Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, speaker `Ryan`, `gpt-5.4-mini`, `chunk_size=8`, `token_holdback=1`, `do_sample=True`, `temperature=0.9`, `top_k=50`, `top_p=1.0`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. The TTS model was warmed before request timing, so model load and warmup are excluded from the request timeline.
+
+| OpenAI target | Text-delta first audio | Full-text first audio | First audio saved | TTFA speedup | First-token-to-audio | Audio before LLM done |
 |---:|---:|---:|---:|---:|---:|---:|
-| 100 tokens | 2.064s | 2.981s | 2.349s | 3.241s | 0.285s | 0.632s |
-| 200 tokens | 1.528s | 2.962s | 1.821s | 3.223s | 0.294s | 1.140s |
-| 500 tokens | 1.367s | 4.486s | 1.634s | 4.751s | 0.267s | 2.851s |
+| 100 tokens | 2.349s | 3.241s | 0.892s | 1.38x | 0.285s | 0.632s |
+| 200 tokens | 1.821s | 3.223s | 1.402s | 1.77x | 0.294s | 1.140s |
+| 500 tokens | 1.634s | 4.751s | 3.117s | 2.91x | 0.267s | 2.851s |
+
+In this run, the TTS-side delay after the first LLM text delta was consistently about 0.27-0.29s. As the LLM response gets longer, the full-text path waits linearly for more text, while the text-delta path can already be producing audio.
 
 Reproduce the README benchmark and curated samples:
 
