@@ -235,7 +235,7 @@ The Python streaming methods are pull-based generators: they prepare the next ch
 
 ### Text-delta input streaming
 
-The `generate_*_streaming` methods stream audio out of TTS after the full text prompt is already known. The `stream_*_from_text_deltas` methods stream text into TTS while an upstream LLM is still producing the prompt. This is the front-side streaming path: it is designed to reduce time from "LLM starts answering" to "first playable TTS audio".
+The `generate_*_streaming` methods stream audio out of TTS after the full text prompt is already known. The `stream_*_from_text_deltas` methods stream text into TTS while an upstream LLM is still producing the prompt. This is input text streaming, not a new server protocol: it is designed to reduce time from "LLM starts answering" to "first playable TTS audio".
 
 ```python
 text_deltas = ["Hello", ", this is ", "streaming input."]
@@ -255,7 +255,70 @@ Available methods:
 - `stream_voice_design_from_text_deltas(...)`
 - `stream_voice_clone_from_text_deltas(...)`
 
-The input committer retokenizes the accumulated text with the same assistant wrapper used by normal generation, commits stable content tokens, and holds back the final token by default (`token_holdback=1`) to avoid unstable BPE boundaries. Set `token_holdback=0` for the most aggressive latency, or increase it to keep more local text lookahead before feeding TTS. When the input iterator ends, the remaining text tokens and the TTS EOS token are flushed.
+#### API comparison
+
+| API | Input | Output | Notes |
+|---|---|---|---|
+| `generate_*_streaming(...)` | Complete text string | Qwen TTS audio chunks | Existing faster-qwen3-tts audio-output streaming path. |
+| `stream_*_from_text_deltas(...)` | Iterable of partial text chunks | Qwen TTS audio chunks | New Python API for LLM-style text-delta input. |
+| OpenAI [`/v1/audio/speech`](https://platform.openai.com/docs/api-reference/audio/createSpeech) | Complete `input` text | Audio response / streamed audio bytes | Standard speech API pattern: text is already complete before TTS starts. |
+| OpenAI [Responses streaming](https://platform.openai.com/docs/guides/streaming) | Prompt/messages | Text deltas such as [`response.output_text.delta`](https://platform.openai.com/docs/api-reference/responses-streaming/response/output_text/delta) | LLM text streaming pattern; this fork bridges those deltas into Qwen TTS. |
+
+The input committer retokenizes the accumulated text with the same assistant wrapper used by normal generation, commits stable content tokens, and holds back the final token by default to avoid unstable BPE boundaries. When the input iterator ends, the remaining text tokens and the TTS EOS token are flushed.
+
+| `token_holdback` | Behavior |
+|---|---|
+| `0` | Lowest latency. Highest risk that an early BPE token later changes when the next characters arrive. |
+| `1` | Default balanced mode. Keeps one token of local lookahead before feeding TTS. |
+| `3+` | More conservative local lookahead. Higher latency, but can help phrasing when upstream deltas split words or clauses aggressively. |
+
+Full-text generation remains best when maximum prosody and future sentence context matter more than latency.
+
+#### Live input-streaming benchmark
+
+These numbers measure a real OpenAI Responses stream feeding `stream_custom_voice_from_text_deltas(...)` directly, compared with waiting for the same OpenAI response to finish before calling `generate_custom_voice_streaming(...)`. Rows with a TTS `max_new_tokens` cap are excluded; all rows below completed without hitting the cap.
+
+Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, speaker `Ryan`, `gpt-5.4-mini`, `chunk_size=8`, `token_holdback=1`, `do_sample=True`, `temperature=0.9`, `top_k=50`, `top_p=1.0`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. The TTS model was warmed before request timing, so model load and CUDA graph capture are excluded from the request timeline.
+
+| OpenAI target | OpenAI first token | OpenAI done | First audio from text deltas | Full-text first audio | First-token-to-audio | Audio before LLM done |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 tokens | 2.064s | 2.981s | 2.349s | 3.241s | 0.285s | 0.632s |
+| 200 tokens | 1.528s | 2.962s | 1.821s | 3.223s | 0.294s | 1.140s |
+| 500 tokens | 1.367s | 4.486s | 1.634s | 4.751s | 0.267s | 2.851s |
+
+Reproduce the README benchmark and curated samples:
+
+```bash
+python benchmarks/text_delta_readme_benchmark.py \
+  --openai-model gpt-5.4-mini \
+  --targets 100 200 500 \
+  --chunk-size 8 \
+  --token-holdback 1 \
+  --max-new-tokens 4096
+```
+
+The script requires `OPENAI_API_KEY` in the environment. It writes CSV summaries, JSONL timelines, and full generated WAV output under the ignored `text_delta_readme_benchmark/` directory. Curated sample WAVs are written under `samples/text_delta_streaming/`.
+
+Manual GPU validation should check that every `stream_*_from_text_deltas(...)` mode yields nonempty PCM chunks, the sample rate is valid, concatenated WAV writing succeeds, the matching full-text streaming path still produces audio, and README benchmark rows are not capped by `max_new_tokens`. Sample QA checks verify that committed WAV files exist, have nonzero duration, contain finite non-silent samples, and are linked from the sample README.
+
+#### Text-delta samples
+
+Each pair uses the same text and generation settings except for the input path: text-delta input streaming vs complete-text audio-output streaming.
+
+**CustomVoice 200-token sample**
+
+<audio controls src="samples/text_delta_streaming/custom_voice_200_text_delta.wav"></audio>
+<audio controls src="samples/text_delta_streaming/custom_voice_200_fulltext.wav"></audio>
+
+**VoiceDesign 100-token sample**
+
+<audio controls src="samples/text_delta_streaming/voice_design_100_text_delta.wav"></audio>
+<audio controls src="samples/text_delta_streaming/voice_design_100_fulltext.wav"></audio>
+
+**Voice clone x-vector 100-token sample**
+
+<audio controls src="samples/text_delta_streaming/voice_clone_xvec_100_text_delta.wav"></audio>
+<audio controls src="samples/text_delta_streaming/voice_clone_xvec_100_fulltext.wav"></audio>
 
 This V1 API is Python-only. Server/WebSocket protocols can adapt to it by passing incoming text chunks as `text_deltas`, but no server wire protocol is added here. For real-model validation, run a small GPU smoke test that verifies the text-delta API yields multiple nonempty audio chunks and that the existing full-text streaming APIs still work.
 
