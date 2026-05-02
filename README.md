@@ -255,6 +255,24 @@ Available methods:
 - `stream_voice_design_from_text_deltas(...)`
 - `stream_voice_clone_from_text_deltas(...)`
 
+#### What this branch adds
+
+The upstream `andimarafioti/faster-qwen3-tts` API already supports audio-output streaming: callers pass a complete text string to `generate_*_streaming(...)`, and the model yields playable audio chunks while it generates speech.
+
+This branch adds text-input streaming on top of that. Callers can pass an iterator of raw text deltas to `stream_*_from_text_deltas(...)`, usually the chunks arriving from an upstream LLM. The output contract remains the same shape as the existing streaming APIs: each yield is `(audio_chunk, sample_rate, timing)`.
+
+| Capability | Upstream repo | This branch |
+|---|---|---|
+| Full-text non-streaming TTS | `generate_* (...)` | Unchanged |
+| Full-text input, streamed audio output | `generate_*_streaming(...)` | Unchanged |
+| LLM-style text deltas, streamed audio output | Not available | `stream_*_from_text_deltas(...)` |
+| Server/WebSocket/OpenAI-compatible API changes | Existing upstream behavior only | Not changed in this branch |
+| Latency knob for BPE stability | Not applicable | `token_holdback` |
+
+Use `generate_*_streaming(...)` when your application already has the full utterance. Use `stream_*_from_text_deltas(...)` when text is still arriving and time to first audio matters more than giving TTS the full future sentence upfront.
+
+Architecturally, this is not a faster decoder or a replacement for audio-output streaming. The upstream path is `complete text -> TTS -> audio chunks`. This branch adds `text deltas -> stable text tokens -> TTS -> audio chunks`, so LLM generation and TTS generation can overlap. If full text is already available, the existing full-text APIs remain the simplest path and may preserve the best future-context prosody. If the text source is a streaming LLM, the saved wait grows with response length because TTS no longer sits idle until the LLM finishes.
+
 #### API comparison
 
 | API | Input | Output | Notes |
