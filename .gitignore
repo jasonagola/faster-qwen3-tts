@@ -13,6 +13,7 @@ openai_live_torture*/
 openai_text_delta_latency/
 qwen3_compare_text_delta*/
 text_delta_readme_benchmark/
+text_delta_normalized_benchmark/
 !samples/text_delta_streaming/
 !samples/text_delta_streaming/README.md
 !samples/text_delta_streaming/*.wav

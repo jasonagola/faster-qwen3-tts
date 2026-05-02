@@ -93,31 +93,49 @@ The text-delta committer retokenizes accumulated text with the same assistant wr
 
 Full-text generation remains best when maximum prosody and future sentence context matter more than latency.
 
-## Benchmark: Text Deltas vs Full Text
+## Benchmark: Normalized LLM-to-TTS Timeline
 
-These numbers isolate the benefit of text-delta input streaming. Both paths use the same TTS model, same audio-output streaming path, same speaker, same generation settings, and the same OpenAI-generated text. The only difference is when TTS is allowed to start:
+This benchmark records a real OpenAI Responses stream once, then replays the exact same text deltas with the same inter-delta timing into each TTS path. Every downstream TTS number is normalized to the first LLM text delta:
 
-- Full-text path: wait for the LLM response to finish, then call `generate_custom_voice_streaming(...)`.
-- Text-delta path: feed OpenAI `response.output_text.delta` chunks directly into `stream_custom_voice_from_text_deltas(...)`.
+```text
+first OpenAI response.output_text.delta == T+0.000s
+```
 
-The full-text path still streams audio once TTS starts. The performance gain below comes from removing the full-text wait before TTS can begin. Rows with a TTS `max_new_tokens` cap are excluded; all rows below completed without hitting the cap.
+That makes the comparison specific to what a user feels after the LLM starts answering. The benchmark separates two different gains:
 
-Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, speaker `Ryan`, `gpt-5.4-mini`, `chunk_size=8`, `token_holdback=1`, `do_sample=True`, `temperature=0.9`, `top_k=50`, `top_p=1.0`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. The TTS model was warmed before request timing, so model load and warmup are excluded from the request timeline.
+- **Backend implementation gain:** FasterQwen3TTS vs vanilla `Qwen3TTSModel`.
+- **Front-side input streaming gain:** text deltas into TTS vs waiting for full LLM text.
 
-| OpenAI target | Text-delta first audio | Full-text first audio | First audio saved | TTFA speedup | First-token-to-audio | Audio before LLM done |
-|---:|---:|---:|---:|---:|---:|---:|
-| 100 tokens | 2.349s | 3.241s | 0.892s | 1.38x | 0.285s | 0.632s |
-| 200 tokens | 1.821s | 3.223s | 1.402s | 1.77x | 0.294s | 1.140s |
-| 500 tokens | 1.634s | 4.751s | 3.117s | 2.91x | 0.267s | 2.851s |
+The vanilla full-text path uses `Qwen3TTSModel.generate_custom_voice(...)`, which returns complete audio rather than yielding a first audio chunk, so the benchmark reports **audio-ready time** for that path. The vanilla text-delta column uses `Qwen3TTSModel.stream_custom_voice_from_text_deltas(...)` when that companion API is available; it isolates backend speed with the same front-side streaming concept. Rows with a TTS `max_new_tokens` cap are excluded; all rows below completed without hitting the cap.
 
-In this run, the TTS-side delay after the first LLM text delta was consistently about 0.27-0.29s. As the LLM response gets longer, the full-text path waits linearly for more text, while the text-delta path can already be producing audio.
+Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, speaker `Ryan`, `gpt-5.4-mini`, `chunk_size=8`, `token_holdback=1`, `do_sample=True`, `temperature=0.9`, `top_k=50`, `top_p=1.0`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. Model load and warmup are excluded.
+
+🟩 means at least 1s saved, 🟨 means 0.25-1s saved, and ⬜ means under 0.25s saved.
+
+### Normalized Timeline
+
+| Target | LLM done | Vanilla full-text audio ready | Faster full-text first audio | Vanilla text-delta first audio | Faster text-delta first audio |
+|---:|---:|---:|---:|---:|---:|
+| 100 tokens | T+1.109s | T+28.456s | T+1.369s | T+0.471s | T+0.312s |
+| 200 tokens | T+3.036s | T+43.764s | T+3.302s | T+0.436s | T+0.265s |
+| 500 tokens | T+3.105s | T+94.484s | T+3.373s | T+0.428s | T+0.263s |
+
+### Improvement Breakdown
+
+| Target | Faster backend gain, full-text | Faster backend gain, text-delta | Front-side gain on Faster | Front-side gain on vanilla | Total gain: Faster text-delta vs vanilla full-text |
+|---:|---:|---:|---:|---:|---:|
+| 100 tokens | 🟩 27.086s | ⬜ 0.160s | 🟩 1.058s | 🟩 27.984s | 🟩 28.144s (91.21x) |
+| 200 tokens | 🟩 40.462s | ⬜ 0.171s | 🟩 3.037s | 🟩 43.328s | 🟩 43.499s (165.15x) |
+| 500 tokens | 🟩 91.111s | ⬜ 0.165s | 🟩 3.111s | 🟩 94.056s | 🟩 94.222s (359.25x) |
+
+In this run, Faster text-delta first audio stayed around `T+0.26-0.31s` after the first LLM token. The backend implementation removes most of the vanilla full-audio wait, and front-side text streaming removes the remaining wait for the full LLM response.
 
 ## Reproduce The Benchmark
 
 ```bash
 export OPENAI_API_KEY=...
 
-python benchmarks/text_delta_readme_benchmark.py \
+python benchmarks/text_delta_normalized_benchmark.py \
   --openai-model gpt-5.4-mini \
   --targets 100 200 500 \
   --chunk-size 8 \
@@ -125,7 +143,7 @@ python benchmarks/text_delta_readme_benchmark.py \
   --max-new-tokens 4096
 ```
 
-The script writes CSV summaries, JSONL timelines, and generated WAV output under the ignored `text_delta_readme_benchmark/` directory. Curated sample WAVs are written under `samples/text_delta_streaming/`.
+The script writes normalized CSV summaries, OpenAI text recordings, and a README-ready Markdown table under the ignored `text_delta_normalized_benchmark/` directory. Add `--write-wavs` if you also want generated WAVs for each measured path.
 
 ## Text-Delta Samples
 
@@ -226,6 +244,7 @@ python3 -m py_compile \
   faster_qwen3_tts/model.py \
   faster_qwen3_tts/streaming.py \
   faster_qwen3_tts/text_delta.py \
+  benchmarks/text_delta_normalized_benchmark.py \
   benchmarks/text_delta_readme_benchmark.py
 
 python3 -m pytest \
