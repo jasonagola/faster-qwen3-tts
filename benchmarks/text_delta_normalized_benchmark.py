@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Benchmark LLM-to-TTS timing normalized to the first LLM text token.
+"""Four-way LLM-to-TTS benchmark normalized to the first prepared token.
 
-The benchmark records a real OpenAI Responses stream once per target length,
-then replays the same text deltas with the same inter-delta timing into each
-TTS implementation. This keeps the LLM side identical while comparing:
+The benchmark uses prepared local text and replays exactly N text deltas at a
+fixed token rate. This removes live LLM output variance while preserving the
+timeline shape of an LLM streaming text into TTS.
 
-- vanilla Qwen3-TTS full-text input
-- FasterQwen3TTS full-text input
-- FasterQwen3TTS text-delta input
+Default comparison:
 
-It can optionally measure a patched vanilla Qwen3-TTS text-delta path when
---include-vanilla-text-delta is passed, but that is not part of the default
-public comparison because stock vanilla Qwen3-TTS does not stream audio.
+1. Vanilla Qwen3-TTS: full text in, complete audio out.
+2. Qwen3-TTS-streaming: full text in, first streamed audio chunk out.
+3. FasterQwen3TTS: full text in, first streamed audio chunk out.
+4. This fork: text deltas in, first streamed audio chunk out.
 
-Output is written under --out-dir, which is ignored by git.
+The `qwen_tts` package name collides between vanilla and streaming forks, so
+those measurements run in isolated subprocesses with explicit PYTHONPATHs.
 """
 from __future__ import annotations
 
@@ -21,15 +21,13 @@ import argparse
 import csv
 import json
 import os
+import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-from argparse import Namespace
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Optional
 
 import numpy as np
 import soundfile as sf
@@ -37,33 +35,37 @@ import torch
 
 
 THIS_REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(THIS_REPO))
-
-from faster_qwen3_tts import FasterQwen3TTS  # noqa: E402
-
-
-DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
-DEFAULT_CUSTOM_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+DEFAULT_REF_TEXT = (
+    "I'm confused why some people have super short timelines, yet at the same time are bullish on scaling up "
+    "reinforcement learning atop LLMs."
+)
+PREPARED_TEXT_SOURCE = """
+Wimbledon has always balanced ritual with reinvention. The white clothing,
+the clipped grass, and the careful silence before a serve still make the
+tournament feel tied to another age, yet the tennis itself has changed
+dramatically. Wooden rackets rewarded touch, timing, and quick approaches to
+the net. Graphite rackets brought more power, more spin, and a baseline game
+that can stretch a rally from corner to corner. Serve and volley once defined
+grass court instincts, but modern players defend, slide, recover, and counter
+with athletic patterns shaped by sports science. Prize money, global coverage,
+training teams, nutrition, analytics, Hawk Eye, and roofed courts have all made
+the event more professional and more predictable without erasing its old
+tension. The result is a championship that still looks traditional while asking
+players to solve a faster, stronger, more technical version of tennis.
+"""
 
 
 @dataclass
 class TextRecording:
     target_tokens: int
     text: str
-    first_token_s: float
-    done_s: float
-    output_tokens: Optional[int]
-    status: Optional[str]
+    done_after_first_token_s: float
     delta_events: list[dict]
-    timeline: list[dict]
-
-    @property
-    def done_after_first_token_s(self) -> float:
-        return self.done_s - self.first_token_s
 
 
 @dataclass
-class TtsMeasurement:
+class Measurement:
     label: str
     first_audio_s: Optional[float]
     audio_done_s: Optional[float]
@@ -71,21 +73,17 @@ class TtsMeasurement:
     samples: int = 0
     sample_rate: Optional[int] = None
     hit_cap: Optional[bool] = None
-    available: bool = True
     note: str = ""
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Compare vanilla Qwen3-TTS and FasterQwen3TTS normalized to first LLM token."
-    )
-    parser.add_argument("--openai-model", default=DEFAULT_OPENAI_MODEL)
-    parser.add_argument("--openai-base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
-    parser.add_argument("--openai-timeout", type=float, default=180.0)
+    parser = argparse.ArgumentParser(description="Four-way prepared-token LLM-to-TTS benchmark.")
     parser.add_argument("--targets", nargs="+", type=int, default=[100, 200, 500])
-    parser.add_argument("--custom-model", default=DEFAULT_CUSTOM_MODEL)
-    parser.add_argument("--speaker", default="Ryan")
+    parser.add_argument("--simulated-tokens-per-second", type=float, default=30.0)
+    parser.add_argument("--model", default=DEFAULT_BASE_MODEL)
     parser.add_argument("--language", default="English")
+    parser.add_argument("--ref-audio", default="ref_audio.wav")
+    parser.add_argument("--ref-text", default=DEFAULT_REF_TEXT)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--attn-implementation", choices=["sdpa", "eager", "flash_attention_2"], default="sdpa")
@@ -97,15 +95,21 @@ def parse_args():
     sampling = parser.add_mutually_exclusive_group()
     sampling.add_argument("--do-sample", dest="do_sample", action="store_true")
     sampling.add_argument("--no-sample", dest="do_sample", action="store_false")
-    parser.set_defaults(do_sample=True)
+    parser.set_defaults(do_sample=False)
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
     parser.add_argument("--out-dir", type=Path, default=Path("text_delta_normalized_benchmark"))
+    parser.add_argument("--vanilla-repo", type=Path, default=Path("../Qwen3-TTS-vanilla"))
+    parser.add_argument("--streaming-repo", type=Path, default=Path("../Qwen3-TTS-streaming"))
     parser.add_argument("--skip-vanilla", action="store_true")
-    parser.add_argument("--include-vanilla-text-delta", action="store_true")
+    parser.add_argument("--skip-qwen-streaming", action="store_true")
     parser.add_argument("--write-wavs", action="store_true")
+
+    parser.add_argument("--worker-kind", choices=["vanilla", "qwen_streaming"], default=None)
+    parser.add_argument("--worker-config", type=Path, default=None)
+    parser.add_argument("--worker-output", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -143,137 +147,38 @@ def ratio(numerator: Optional[float], denominator: Optional[float]) -> str:
     return f"{denominator / numerator:.2f}x"
 
 
-def build_prompt(target_tokens: int) -> str:
-    return (
-        "Write a natural spoken paragraph about Wimbledon and how tennis has changed over the years. "
-        "Mention tradition, grass-court tactics, wooden rackets, graphite rackets, serve-and-volley, baseline play, "
-        "sports science, prize money, media coverage, Hawk-Eye, and roofed courts. "
-        f"Use about {target_tokens} tokens, stay under {target_tokens + 40} tokens, avoid headings and bullets, "
-        "and end with a complete sentence."
-    )
+def prepared_deltas(target_tokens: int) -> list[str]:
+    source_words = PREPARED_TEXT_SOURCE.split()
+    closing_words = "The match still feels like Wimbledon today.".split()
+    if target_tokens <= len(closing_words):
+        words = closing_words[-target_tokens:]
+    else:
+        body_count = target_tokens - len(closing_words)
+        repeats = (body_count // len(source_words)) + 1
+        words = (source_words * repeats)[:body_count] + closing_words
+    return [word + (" " if index < len(words) - 1 else "") for index, word in enumerate(words)]
 
 
-def iter_sse_events(lines: Iterable[bytes | str]) -> Iterator[tuple[str, str]]:
-    event = "message"
-    data_lines: list[str] = []
-    for raw_line in lines:
-        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
-        line = line.rstrip("\r\n")
-        if not line:
-            if data_lines:
-                yield event, "\n".join(data_lines)
-            event = "message"
-            data_lines = []
-            continue
-        if line.startswith(":"):
-            continue
-        field, separator, value = line.partition(":")
-        if not separator:
-            continue
-        if value.startswith(" "):
-            value = value[1:]
-        if field == "event":
-            event = value
-        elif field == "data":
-            data_lines.append(value)
-    if data_lines:
-        yield event, "\n".join(data_lines)
+def build_recordings(targets: list[int], tokens_per_second: float) -> list[TextRecording]:
+    if tokens_per_second <= 0:
+        raise ValueError("--simulated-tokens-per-second must be > 0.")
 
-
-def record_openai_text(args, target_tokens: int) -> TextRecording:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-
-    body = {
-        "model": args.openai_model,
-        "input": build_prompt(target_tokens),
-        "max_output_tokens": target_tokens + 80,
-        "stream": True,
-        "stream_options": {"include_obfuscation": False},
-        "store": False,
-        "reasoning": {"effort": "none"},
-        "text": {"verbosity": "low"},
-    }
-    request = urllib.request.Request(
-        args.openai_base_url.rstrip("/") + "/responses",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        },
-        method="POST",
-    )
-
-    start = time.perf_counter()
-    first_token_s: Optional[float] = None
-    done_s: Optional[float] = None
-    output_tokens: Optional[int] = None
-    status: Optional[str] = None
-    text_parts: list[str] = []
-    delta_events: list[dict] = []
-    timeline: list[dict] = [
-        {"time_s": 0.0, "source": "openai", "event": "request_start", "target_tokens": target_tokens}
-    ]
-
-    def now_s() -> float:
-        return time.perf_counter() - start
-
-    try:
-        with urllib.request.urlopen(request, timeout=args.openai_timeout) as response:
-            for event_name, data_text in iter_sse_events(response):
-                now = now_s()
-                if data_text == "[DONE]":
-                    timeline.append({"time_s": now, "source": "openai", "event": "done_marker"})
-                    continue
-                data = json.loads(data_text)
-                event_type = data.get("type", event_name)
-                timeline.append({"time_s": now, "source": "openai", "event": event_type})
-
-                if event_type == "response.output_text.delta":
-                    delta = data.get("delta", "")
-                    if delta:
-                        if first_token_s is None:
-                            first_token_s = now
-                            timeline.append({"time_s": now, "source": "openai", "event": "first_text_delta"})
-                        text_parts.append(delta)
-                        delta_events.append({"time_s": now, "delta": delta})
-                elif event_type == "response.output_text.done":
-                    text = data.get("text")
-                    if isinstance(text, str) and text:
-                        text_parts = [text]
-                elif event_type in {"response.completed", "response.incomplete"}:
-                    done_s = now
-                    response_obj = data.get("response", {})
-                    status = response_obj.get("status")
-                    usage = response_obj.get("usage") or {}
-                    output_tokens = usage.get("output_tokens")
-                    error = response_obj.get("error") or data.get("error")
-                    if error:
-                        raise RuntimeError(f"OpenAI stream ended with {event_type}: {error}")
-                elif event_type == "response.failed" or data.get("error"):
-                    raise RuntimeError(f"OpenAI stream failed: {data.get('error')}")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenAI HTTP {exc.code}: {detail}") from exc
-
-    if first_token_s is None:
-        raise RuntimeError("OpenAI stream produced no text deltas.")
-    if done_s is None:
-        done_s = now_s()
-        timeline.append({"time_s": done_s, "source": "openai", "event": "stream_closed"})
-
-    return TextRecording(
-        target_tokens=target_tokens,
-        text="".join(text_parts),
-        first_token_s=first_token_s,
-        done_s=done_s,
-        output_tokens=output_tokens,
-        status=status,
-        delta_events=delta_events,
-        timeline=timeline,
-    )
+    recordings = []
+    for target in targets:
+        deltas = prepared_deltas(target)
+        delta_events = [
+            {"time_s": index / tokens_per_second, "delta": delta}
+            for index, delta in enumerate(deltas)
+        ]
+        recordings.append(
+            TextRecording(
+                target_tokens=target,
+                text="".join(deltas).strip(),
+                done_after_first_token_s=delta_events[-1]["time_s"] if delta_events else 0.0,
+                delta_events=delta_events,
+            )
+        )
+    return recordings
 
 
 def make_delta_replay(recording: TextRecording):
@@ -281,8 +186,7 @@ def make_delta_replay(recording: TextRecording):
 
     def replay():
         for event in recording.delta_events:
-            target_s = max(0.0, float(event["time_s"]) - recording.first_token_s)
-            sleep_s = start + target_s - time.perf_counter()
+            sleep_s = start + float(event["time_s"]) - time.perf_counter()
             if sleep_s > 0:
                 time.sleep(sleep_s)
             yield event["delta"]
@@ -290,69 +194,28 @@ def make_delta_replay(recording: TextRecording):
     return replay(), start
 
 
-def faster_model(args):
-    return FasterQwen3TTS.from_pretrained(
-        args.custom_model,
-        device=args.device,
-        dtype=resolve_dtype(args.dtype),
-        attn_implementation=args.attn_implementation,
-        max_seq_len=args.max_seq_len,
-    )
-
-
-def vanilla_model(args):
-    from qwen_tts import Qwen3TTSModel
-
-    return Qwen3TTSModel.from_pretrained(
-        args.custom_model,
-        device_map=args.device,
-        dtype=resolve_dtype(args.dtype),
-        attn_implementation=args.attn_implementation,
-    )
-
-
-def common_generation_kwargs(args, include_chunk_size: bool):
+def generation_kwargs(config: dict, include_sampling: bool = True) -> dict:
     kwargs = {
-        "max_new_tokens": args.max_new_tokens,
-        "min_new_tokens": args.min_new_tokens,
-        "temperature": args.temperature,
-        "top_k": args.top_k,
-        "top_p": args.top_p,
-        "do_sample": args.do_sample,
-        "repetition_penalty": args.repetition_penalty,
+        "max_new_tokens": config["max_new_tokens"],
+        "min_new_tokens": config["min_new_tokens"],
+        "do_sample": config["do_sample"],
+        "repetition_penalty": config["repetition_penalty"],
     }
-    if include_chunk_size:
-        kwargs["chunk_size"] = args.chunk_size
+    if config["do_sample"] and include_sampling:
+        kwargs.update(
+            {
+                "temperature": config["temperature"],
+                "top_k": config["top_k"],
+                "top_p": config["top_p"],
+            }
+        )
     return kwargs
 
 
-def warm_faster(args, model):
-    warm = Namespace(**vars(args))
-    warm.max_new_tokens = 24
-    warm.min_new_tokens = 1
-    warm.chunk_size = 1
-    stream = model.generate_custom_voice_streaming(
-        text="Wimbledon changed as tennis modernized.",
-        speaker=args.speaker,
-        language=args.language,
-        **common_generation_kwargs(warm, include_chunk_size=True),
-    )
-    for _ in stream:
-        break
-    sync_device()
-
-
-def warm_vanilla(args, model):
-    warm = Namespace(**vars(args))
-    warm.max_new_tokens = 24
-    warm.min_new_tokens = 1
-    _ = model.generate_custom_voice(
-        text="Wimbledon changed as tennis modernized.",
-        speaker=args.speaker,
-        language=args.language,
-        **common_generation_kwargs(warm, include_chunk_size=False),
-    )
-    sync_device()
+def qwen_streaming_generation_kwargs(config: dict) -> dict:
+    kwargs = generation_kwargs(config)
+    kwargs.pop("repetition_penalty", None)
+    return kwargs
 
 
 def normalize_audio(audio) -> np.ndarray:
@@ -365,11 +228,11 @@ def normalize_audio(audio) -> np.ndarray:
     return np.asarray(audio).reshape(-1)
 
 
-def drain_stream(stream_iter, label: str, start_time: float, max_new_tokens: int, chunk_size: int) -> tuple[np.ndarray, TtsMeasurement]:
+def drain_stream(stream_iter, label: str, start_time: float, max_new_tokens: int, chunk_size: int):
     chunks = []
     sample_rate = None
     first_audio_s = None
-    for chunk_index, item in enumerate(stream_iter):
+    for item in stream_iter:
         chunk, sample_rate = item[:2]
         sync_device()
         now = time.perf_counter() - start_time
@@ -382,7 +245,7 @@ def drain_stream(stream_iter, label: str, start_time: float, max_new_tokens: int
     if not chunks:
         raise RuntimeError(f"{label} produced no audio chunks.")
     audio = np.concatenate(chunks)
-    measurement = TtsMeasurement(
+    return audio, Measurement(
         label=label,
         first_audio_s=first_audio_s,
         audio_done_s=done_s,
@@ -391,182 +254,335 @@ def drain_stream(stream_iter, label: str, start_time: float, max_new_tokens: int
         sample_rate=int(sample_rate),
         hit_cap=len(chunks) * chunk_size >= max_new_tokens,
     )
-    return audio, measurement
 
 
-def run_faster_text_delta(args, model, recording: TextRecording):
-    deltas, start = make_delta_replay(recording)
-    stream = model.stream_custom_voice_from_text_deltas(
-        text_deltas=deltas,
-        speaker=args.speaker,
-        language=args.language,
-        token_holdback=args.token_holdback,
-        **common_generation_kwargs(args, include_chunk_size=True),
-    )
-    return drain_stream(stream, "faster_text_delta", start, args.max_new_tokens, args.chunk_size)
-
-
-def run_faster_fulltext(args, model, recording: TextRecording):
-    start = time.perf_counter()
-    stream = model.generate_custom_voice_streaming(
-        text=recording.text,
-        speaker=args.speaker,
-        language=args.language,
-        **common_generation_kwargs(args, include_chunk_size=True),
-    )
-    audio, measurement = drain_stream(stream, "faster_fulltext", start, args.max_new_tokens, args.chunk_size)
-    measurement.first_audio_s += recording.done_after_first_token_s
-    measurement.audio_done_s += recording.done_after_first_token_s
-    return audio, measurement
-
-
-def run_vanilla_text_delta(args, model, recording: TextRecording):
-    if not hasattr(model, "stream_custom_voice_from_text_deltas"):
-        return None, TtsMeasurement(
-            label="vanilla_text_delta",
-            first_audio_s=None,
-            audio_done_s=None,
-            available=False,
-            note="Qwen3TTSModel has no stream_custom_voice_from_text_deltas method.",
-        )
-    deltas, start = make_delta_replay(recording)
-    stream = model.stream_custom_voice_from_text_deltas(
-        text_deltas=deltas,
-        speaker=args.speaker,
-        language=args.language,
-        audio_chunk_code_frames=args.chunk_size,
-        token_holdback=args.token_holdback,
-        **common_generation_kwargs(args, include_chunk_size=False),
-    )
-    return drain_stream(stream, "vanilla_text_delta", start, args.max_new_tokens, args.chunk_size)
-
-
-def run_vanilla_fulltext(args, model, recording: TextRecording):
-    start = time.perf_counter()
-    audio_list, sample_rate = model.generate_custom_voice(
-        text=recording.text,
-        speaker=args.speaker,
-        language=args.language,
-        **common_generation_kwargs(args, include_chunk_size=False),
-    )
-    sync_device()
-    elapsed = time.perf_counter() - start
-    audio = normalize_audio(audio_list)
-    ready_s = recording.done_after_first_token_s + elapsed
-    measurement = TtsMeasurement(
-        label="vanilla_fulltext",
-        first_audio_s=ready_s,
-        audio_done_s=ready_s,
-        chunks=1,
-        samples=int(audio.shape[0]),
-        sample_rate=int(sample_rate),
-        hit_cap=None,
-        note="Vanilla full-text path returns complete audio; first audio is audio-ready time.",
-    )
-    return audio, measurement
-
-
-def write_wav(args, target: int, label: str, audio: Optional[np.ndarray], sample_rate: Optional[int]):
-    if not args.write_wavs or audio is None or sample_rate is None:
+def write_wav(config: dict, target: int, label: str, audio: Optional[np.ndarray], sample_rate: Optional[int]):
+    if not config["write_wavs"] or audio is None or sample_rate is None:
         return
-    path = args.out_dir / "wav" / f"custom_voice_{target}_{label}.wav"
+    path = Path(config["out_dir"]) / "wav" / f"voice_clone_{target}_{label}.wav"
     path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(path, audio, sample_rate)
 
 
-def saved(a: TtsMeasurement, b: TtsMeasurement) -> Optional[float]:
-    if a.first_audio_s is None or b.first_audio_s is None:
+def run_faster(config: dict, recordings: list[TextRecording]) -> dict[str, dict[int, Measurement]]:
+    from faster_qwen3_tts import FasterQwen3TTS
+
+    model = FasterQwen3TTS.from_pretrained(
+        config["model"],
+        device=config["device"],
+        dtype=resolve_dtype(config["dtype"]),
+        attn_implementation=config["attn_implementation"],
+        max_seq_len=config["max_seq_len"],
+    )
+
+    warm_kwargs = dict(config)
+    warm_kwargs["max_new_tokens"] = 24
+    warm_kwargs["min_new_tokens"] = 1
+    warm_kwargs["chunk_size"] = 1
+    warm_stream = model.generate_voice_clone_streaming(
+        text="Wimbledon changed as tennis modernized.",
+        language=config["language"],
+        ref_audio=config["ref_audio"],
+        ref_text=config["ref_text"],
+        xvec_only=True,
+        chunk_size=1,
+        **generation_kwargs(warm_kwargs),
+    )
+    for _ in warm_stream:
+        break
+    sync_device()
+
+    results: dict[str, dict[int, Measurement]] = {
+        "faster_text_delta": {},
+        "faster_fulltext": {},
+    }
+    for recording in recordings:
+        deltas, start = make_delta_replay(recording)
+        stream = model.stream_voice_clone_from_text_deltas(
+            text_deltas=deltas,
+            language=config["language"],
+            ref_audio=config["ref_audio"],
+            ref_text=config["ref_text"],
+            xvec_only=True,
+            chunk_size=config["chunk_size"],
+            token_holdback=config["token_holdback"],
+            **generation_kwargs(config),
+        )
+        audio, measurement = drain_stream(
+            stream, "faster_text_delta", start, config["max_new_tokens"], config["chunk_size"]
+        )
+        results["faster_text_delta"][recording.target_tokens] = measurement
+        write_wav(config, recording.target_tokens, measurement.label, audio, measurement.sample_rate)
+
+        start = time.perf_counter()
+        stream = model.generate_voice_clone_streaming(
+            text=recording.text,
+            language=config["language"],
+            ref_audio=config["ref_audio"],
+            ref_text=config["ref_text"],
+            xvec_only=True,
+            chunk_size=config["chunk_size"],
+            **generation_kwargs(config),
+        )
+        audio, measurement = drain_stream(
+            stream, "faster_fulltext", start, config["max_new_tokens"], config["chunk_size"]
+        )
+        measurement.first_audio_s += recording.done_after_first_token_s
+        measurement.audio_done_s += recording.done_after_first_token_s
+        results["faster_fulltext"][recording.target_tokens] = measurement
+        write_wav(config, recording.target_tokens, measurement.label, audio, measurement.sample_rate)
+
+    del model
+    sync_device()
+    torch.cuda.empty_cache()
+    return results
+
+
+def qwen_model(config: dict):
+    repo = Path(config["repo"]).resolve()
+    sys.path.insert(0, str(repo))
+    for name in list(sys.modules):
+        if name == "qwen_tts" or name.startswith("qwen_tts."):
+            sys.modules.pop(name, None)
+    from qwen_tts import Qwen3TTSModel
+
+    return Qwen3TTSModel.from_pretrained(
+        config["model"],
+        device_map=config["device"],
+        dtype=resolve_dtype(config["dtype"]),
+        attn_implementation=config["attn_implementation"],
+    )
+
+
+def worker_vanilla(config: dict, recordings: list[TextRecording]) -> dict[int, Measurement]:
+    model = qwen_model(config)
+    warm_kwargs = dict(config)
+    warm_kwargs["max_new_tokens"] = 24
+    warm_kwargs["min_new_tokens"] = 1
+    _ = model.generate_voice_clone(
+        text="Wimbledon changed as tennis modernized.",
+        language=config["language"],
+        ref_audio=config["ref_audio"],
+        ref_text=config["ref_text"],
+        x_vector_only_mode=True,
+        **generation_kwargs(warm_kwargs),
+    )
+    sync_device()
+
+    results = {}
+    for recording in recordings:
+        start = time.perf_counter()
+        audio_list, sample_rate = model.generate_voice_clone(
+            text=recording.text,
+            language=config["language"],
+            ref_audio=config["ref_audio"],
+            ref_text=config["ref_text"],
+            x_vector_only_mode=True,
+            **generation_kwargs(config),
+        )
+        sync_device()
+        elapsed = time.perf_counter() - start
+        audio = normalize_audio(audio_list)
+        ready_s = recording.done_after_first_token_s + elapsed
+        measurement = Measurement(
+            label="vanilla_fulltext",
+            first_audio_s=ready_s,
+            audio_done_s=ready_s,
+            chunks=1,
+            samples=int(audio.shape[0]),
+            sample_rate=int(sample_rate),
+            note="Vanilla Qwen3-TTS returns complete audio; first_audio_s is audio-ready time.",
+        )
+        results[recording.target_tokens] = measurement
+        write_wav(config, recording.target_tokens, measurement.label, audio, measurement.sample_rate)
+    return results
+
+
+def worker_qwen_streaming(config: dict, recordings: list[TextRecording]) -> dict[int, Measurement]:
+    model = qwen_model(config)
+
+    if hasattr(model, "enable_streaming_optimizations") and config.get("qwen_streaming_optimized", False):
+        model.enable_streaming_optimizations(
+            decode_window_frames=config["streaming_decode_window_frames"],
+            use_compile=True,
+            compile_mode="reduce-overhead",
+        )
+
+    warm_kwargs = dict(config)
+    warm_kwargs["max_new_tokens"] = 24
+    warm_kwargs["min_new_tokens"] = 1
+    stream = model.stream_generate_voice_clone(
+        text="Wimbledon changed as tennis modernized.",
+        language=config["language"],
+        ref_audio=config["ref_audio"],
+        ref_text=config["ref_text"],
+        x_vector_only_mode=True,
+        emit_every_frames=1,
+        decode_window_frames=config["streaming_decode_window_frames"],
+        overlap_samples=0,
+        max_frames=24,
+        use_optimized_decode=config.get("qwen_streaming_optimized", False),
+        first_chunk_emit_every=0,
+        repetition_penalty=config["streaming_repetition_penalty"],
+        **qwen_streaming_generation_kwargs(warm_kwargs),
+    )
+    for _ in stream:
+        break
+    sync_device()
+
+    results = {}
+    for recording in recordings:
+        start = time.perf_counter()
+        stream = model.stream_generate_voice_clone(
+            text=recording.text,
+            language=config["language"],
+            ref_audio=config["ref_audio"],
+            ref_text=config["ref_text"],
+            x_vector_only_mode=True,
+            emit_every_frames=config["chunk_size"],
+            decode_window_frames=config["streaming_decode_window_frames"],
+            overlap_samples=0,
+            max_frames=config["max_new_tokens"],
+            use_optimized_decode=config.get("qwen_streaming_optimized", False),
+            first_chunk_emit_every=0,
+            repetition_penalty=config["streaming_repetition_penalty"],
+            **qwen_streaming_generation_kwargs(config),
+        )
+        audio, measurement = drain_stream(
+            stream, "qwen_streaming_fulltext", start, config["max_new_tokens"], config["chunk_size"]
+        )
+        measurement.first_audio_s += recording.done_after_first_token_s
+        measurement.audio_done_s += recording.done_after_first_token_s
+        results[recording.target_tokens] = measurement
+        write_wav(config, recording.target_tokens, measurement.label, audio, measurement.sample_rate)
+    return results
+
+
+def measurement_to_dict(measurement: Measurement) -> dict:
+    return {
+        "label": measurement.label,
+        "first_audio_s": measurement.first_audio_s,
+        "audio_done_s": measurement.audio_done_s,
+        "chunks": measurement.chunks,
+        "samples": measurement.samples,
+        "sample_rate": measurement.sample_rate,
+        "hit_cap": measurement.hit_cap,
+        "note": measurement.note,
+    }
+
+
+def measurement_from_dict(data: dict) -> Measurement:
+    return Measurement(
+        label=data["label"],
+        first_audio_s=data.get("first_audio_s"),
+        audio_done_s=data.get("audio_done_s"),
+        chunks=data.get("chunks", 0),
+        samples=data.get("samples", 0),
+        sample_rate=data.get("sample_rate"),
+        hit_cap=data.get("hit_cap"),
+        note=data.get("note", ""),
+    )
+
+
+def recordings_to_json(recordings: list[TextRecording]) -> list[dict]:
+    return [
+        {
+            "target_tokens": item.target_tokens,
+            "text": item.text,
+            "done_after_first_token_s": item.done_after_first_token_s,
+            "delta_events": item.delta_events,
+        }
+        for item in recordings
+    ]
+
+
+def recordings_from_json(data: list[dict]) -> list[TextRecording]:
+    return [
+        TextRecording(
+            target_tokens=item["target_tokens"],
+            text=item["text"],
+            done_after_first_token_s=item["done_after_first_token_s"],
+            delta_events=item["delta_events"],
+        )
+        for item in data
+    ]
+
+
+def run_worker(kind: str, config: dict, recordings: list[TextRecording], repo: Path) -> dict[int, Measurement]:
+    worker_dir = Path(config["out_dir"]) / "workers"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    config_path = worker_dir / f"{kind}_config.json"
+    output_path = worker_dir / f"{kind}_output.json"
+    worker_config = dict(config)
+    worker_config["repo"] = str(repo.resolve())
+    worker_config["recordings"] = recordings_to_json(recordings)
+    config_path.write_text(json.dumps(worker_config, indent=2) + "\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo.resolve())
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker-kind",
+        kind,
+        "--worker-config",
+        str(config_path),
+        "--worker-output",
+        str(output_path),
+    ]
+    subprocess.run(cmd, check=True, env=env)
+    data = json.loads(output_path.read_text(encoding="utf-8"))
+    return {int(target): measurement_from_dict(value) for target, value in data.items()}
+
+
+def worker_main(args) -> None:
+    if args.worker_config is None or args.worker_output is None:
+        raise ValueError("--worker-config and --worker-output are required for worker mode.")
+    config = json.loads(args.worker_config.read_text(encoding="utf-8"))
+    recordings = recordings_from_json(config["recordings"])
+    if args.worker_kind == "vanilla":
+        results = worker_vanilla(config, recordings)
+    elif args.worker_kind == "qwen_streaming":
+        results = worker_qwen_streaming(config, recordings)
+    else:
+        raise ValueError(f"Unknown worker kind: {args.worker_kind}")
+    payload = {target: measurement_to_dict(value) for target, value in results.items()}
+    args.worker_output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def saved(a: Optional[Measurement], b: Optional[Measurement]) -> Optional[float]:
+    if a is None or b is None or a.first_audio_s is None or b.first_audio_s is None:
         return None
     return a.first_audio_s - b.first_audio_s
 
 
-def build_summary_row(args, recording: TextRecording, measurements: dict[str, TtsMeasurement]) -> dict:
-    fast_delta = measurements["faster_text_delta"]
-    fast_full = measurements["faster_fulltext"]
-    vanilla_full = measurements.get("vanilla_fulltext")
-    vanilla_delta = measurements.get("vanilla_text_delta")
-
-    row = {
-        "target_tokens": recording.target_tokens,
-        "openai_model": args.openai_model,
-        "openai_output_tokens": recording.output_tokens,
-        "openai_deltas": len(recording.delta_events),
-        "openai_first_token_from_request_s": metric(recording.first_token_s),
-        "llm_done_after_first_token_s": metric(recording.done_after_first_token_s),
-        "faster_text_delta_first_audio_after_first_token_s": metric(fast_delta.first_audio_s),
-        "faster_fulltext_first_audio_after_first_token_s": metric(fast_full.first_audio_s),
-        "faster_text_delta_audio_done_after_first_token_s": metric(fast_delta.audio_done_s),
-        "faster_fulltext_audio_done_after_first_token_s": metric(fast_full.audio_done_s),
-        "faster_frontside_saved_vs_fulltext_s": metric(saved(fast_full, fast_delta)),
-        "faster_text_delta_hit_tts_token_cap": fast_delta.hit_cap,
-        "faster_fulltext_hit_tts_token_cap": fast_full.hit_cap,
-    }
-
-    if vanilla_full is not None:
-        row.update(
+def build_rows(recordings: list[TextRecording], results: dict[str, dict[int, Measurement]]) -> list[dict]:
+    rows = []
+    for recording in recordings:
+        target = recording.target_tokens
+        faster_delta = results["faster_text_delta"].get(target)
+        faster_full = results["faster_fulltext"].get(target)
+        qwen_streaming = results.get("qwen_streaming_fulltext", {}).get(target)
+        vanilla = results.get("vanilla_fulltext", {}).get(target)
+        rows.append(
             {
-                "vanilla_fulltext_audio_ready_after_first_token_s": metric(vanilla_full.first_audio_s),
-                "faster_fulltext_backend_saved_vs_vanilla_fulltext_s": metric(saved(vanilla_full, fast_full)),
-                "faster_text_delta_total_saved_vs_vanilla_fulltext_s": metric(saved(vanilla_full, fast_delta)),
+                "target_tokens": target,
+                "prepared_text_deltas": len(recording.delta_events),
+                "llm_done_after_first_token_s": metric(recording.done_after_first_token_s),
+                "this_repo_text_delta_first_audio_s": metric(faster_delta.first_audio_s if faster_delta else None),
+                "faster_fulltext_first_audio_s": metric(faster_full.first_audio_s if faster_full else None),
+                "qwen_streaming_first_audio_s": metric(qwen_streaming.first_audio_s if qwen_streaming else None),
+                "vanilla_audio_ready_s": metric(vanilla.first_audio_s if vanilla else None),
+                "qwen_streaming_gain_vs_vanilla_s": metric(saved(vanilla, qwen_streaming)),
+                "faster_gain_vs_qwen_streaming_s": metric(saved(qwen_streaming, faster_full)),
+                "frontside_gain_vs_faster_fulltext_s": metric(saved(faster_full, faster_delta)),
+                "total_gain_vs_vanilla_s": metric(saved(vanilla, faster_delta)),
+                "qwen_streaming_hit_tts_token_cap": qwen_streaming.hit_cap if qwen_streaming else "",
+                "faster_fulltext_hit_tts_token_cap": faster_full.hit_cap if faster_full else "",
+                "this_repo_text_delta_hit_tts_token_cap": faster_delta.hit_cap if faster_delta else "",
             }
         )
-    if vanilla_delta is not None:
-        row.update(
-            {
-                "vanilla_text_delta_first_audio_after_first_token_s": metric(vanilla_delta.first_audio_s),
-                "vanilla_frontside_saved_vs_fulltext_s": metric(saved(vanilla_full, vanilla_delta) if vanilla_full else None),
-                "faster_text_delta_backend_saved_vs_vanilla_text_delta_s": metric(saved(vanilla_delta, fast_delta)),
-                "vanilla_text_delta_hit_tts_token_cap": vanilla_delta.hit_cap,
-                "vanilla_text_delta_available": vanilla_delta.available,
-            }
-        )
-    return row
-
-
-def markdown_tables(rows: list[dict]) -> str:
-    lines = [
-        "### Normalized LLM-to-TTS Timeline",
-        "",
-        "`T+0.000s` is the first LLM text delta. ",
-        "🟩 means at least 1s saved, 🟨 means 0.25-1s saved, and ⬜ means under 0.25s saved.",
-        "",
-        "| Target | This repo: Faster + text-delta first audio | LLM done | Faster + full-text first audio | Vanilla Qwen full-text audio ready |",
-        "|---:|---:|---:|---:|---:|",
-    ]
-    for row in rows:
-        lines.append(
-            "| {target} | {fast_delta} | {llm_done} | {fast_full} | {vanilla_full} |".format(
-                target=f"{row['target_tokens']} tokens",
-                fast_delta=tplus(_float(row.get("faster_text_delta_first_audio_after_first_token_s"))),
-                llm_done=tplus(_float(row.get("llm_done_after_first_token_s"))),
-                fast_full=tplus(_float(row.get("faster_fulltext_first_audio_after_first_token_s"))),
-                vanilla_full=tplus(_float(row.get("vanilla_fulltext_audio_ready_after_first_token_s"))),
-            )
-        )
-
-    lines.extend(
-        [
-            "",
-            "### Improvement Breakdown",
-            "",
-            "| Target | Backend gain: Faster full-text vs vanilla full-text | Front-side gain: Faster text-delta vs Faster full-text | Total gain: this repo vs vanilla full-text |",
-            "|---:|---:|---:|---:|",
-        ]
-    )
-    for row in rows:
-        total = _float(row.get("faster_text_delta_total_saved_vs_vanilla_fulltext_s"))
-        fast_delta = _float(row.get("faster_text_delta_first_audio_after_first_token_s"))
-        vanilla_full = _float(row.get("vanilla_fulltext_audio_ready_after_first_token_s"))
-        lines.append(
-            "| {target} | {backend_full} | {front_fast} | {total} ({ratio}) |".format(
-                target=f"{row['target_tokens']} tokens",
-                backend_full=improvement(_float(row.get("faster_fulltext_backend_saved_vs_vanilla_fulltext_s"))),
-                front_fast=improvement(_float(row.get("faster_frontside_saved_vs_fulltext_s"))),
-                total=improvement(total),
-                ratio=ratio(fast_delta, vanilla_full),
-            )
-        )
-    return "\n".join(lines) + "\n"
+    return rows
 
 
 def _float(value) -> Optional[float]:
@@ -575,103 +591,112 @@ def _float(value) -> Optional[float]:
     return float(value)
 
 
-def write_recordings(args, recordings: list[TextRecording]):
-    records_dir = args.out_dir / "recordings"
-    records_dir.mkdir(parents=True, exist_ok=True)
-    for recording in recordings:
-        payload = {
-            "target_tokens": recording.target_tokens,
-            "text": recording.text,
-            "first_token_s": recording.first_token_s,
-            "done_s": recording.done_s,
-            "done_after_first_token_s": recording.done_after_first_token_s,
-            "output_tokens": recording.output_tokens,
-            "status": recording.status,
-            "delta_events": recording.delta_events,
-            "timeline": recording.timeline,
-        }
-        path = records_dir / f"openai_{recording.target_tokens}.json"
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+def markdown_tables(rows: list[dict]) -> str:
+    lines = [
+        "### Normalized Timeline",
+        "",
+        "`T+0.000s` is the first prepared stream token. Columns are ordered from fastest expected first audio to slowest baseline.",
+        "",
+        "| Target | This repo: Faster + text-delta first audio | LLM done | Faster full-text first audio | Qwen3-TTS-streaming first audio | Vanilla Qwen full-text audio ready |",
+        "|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            "| {target} | {this_repo} | {llm_done} | {faster_full} | {qwen_streaming} | {vanilla} |".format(
+                target=f"{row['target_tokens']} tokens",
+                this_repo=tplus(_float(row.get("this_repo_text_delta_first_audio_s"))),
+                llm_done=tplus(_float(row.get("llm_done_after_first_token_s"))),
+                faster_full=tplus(_float(row.get("faster_fulltext_first_audio_s"))),
+                qwen_streaming=tplus(_float(row.get("qwen_streaming_first_audio_s"))),
+                vanilla=tplus(_float(row.get("vanilla_audio_ready_s"))),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "### Improvement Breakdown",
+            "",
+            "🟩 means at least 1s saved, 🟨 means 0.25-1s saved, and ⬜ means under 0.25s saved.",
+            "",
+            "| Target | Backend audio streaming: Qwen streaming vs vanilla | CUDA graph gain: Faster vs Qwen streaming | Front-side gain: text-delta vs Faster full-text | Total gain: this repo vs vanilla |",
+            "|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in rows:
+        total = _float(row.get("total_gain_vs_vanilla_s"))
+        this_repo = _float(row.get("this_repo_text_delta_first_audio_s"))
+        vanilla = _float(row.get("vanilla_audio_ready_s"))
+        lines.append(
+            "| {target} | {streaming} | {faster} | {frontside} | {total} ({ratio}) |".format(
+                target=f"{row['target_tokens']} tokens",
+                streaming=improvement(_float(row.get("qwen_streaming_gain_vs_vanilla_s"))),
+                faster=improvement(_float(row.get("faster_gain_vs_qwen_streaming_s"))),
+                frontside=improvement(_float(row.get("frontside_gain_vs_faster_fulltext_s"))),
+                total=improvement(total),
+                ratio=ratio(this_repo, vanilla),
+            )
+        )
+    return "\n".join(lines) + "\n"
 
 
 def main():
     args = parse_args()
+    if args.worker_kind is not None:
+        worker_main(args)
+        return
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark.")
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is not set.")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    metadata = {
+    config = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "openai_model": args.openai_model,
-        "custom_model": args.custom_model,
+        "model": args.model,
         "targets": args.targets,
-        "speaker": args.speaker,
+        "simulated_tokens_per_second": args.simulated_tokens_per_second,
+        "language": args.language,
+        "ref_audio": str(Path(args.ref_audio).resolve()),
+        "ref_text": args.ref_text,
+        "device": args.device,
+        "dtype": args.dtype,
+        "attn_implementation": args.attn_implementation,
+        "max_seq_len": args.max_seq_len,
+        "max_new_tokens": args.max_new_tokens,
+        "min_new_tokens": args.min_new_tokens,
         "chunk_size": args.chunk_size,
         "token_holdback": args.token_holdback,
-        "max_new_tokens": args.max_new_tokens,
         "do_sample": args.do_sample,
         "temperature": args.temperature,
         "top_k": args.top_k,
         "top_p": args.top_p,
         "repetition_penalty": args.repetition_penalty,
-        "device": args.device,
-        "dtype": args.dtype,
-        "normalization": "All downstream TTS times are seconds after the first OpenAI response.output_text.delta.",
+        "streaming_decode_window_frames": 80,
+        "streaming_repetition_penalty": 1.0,
+        "qwen_streaming_optimized": False,
+        "out_dir": str(args.out_dir),
+        "write_wavs": args.write_wavs,
+        "normalization": "All downstream TTS times are seconds after the first prepared text delta.",
     }
-    (args.out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    (args.out_dir / "metadata.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
-    print("Recording OpenAI streams...", flush=True)
-    recordings = [record_openai_text(args, target) for target in args.targets]
-    write_recordings(args, recordings)
-
-    rows: list[dict] = []
-    measurements_by_target: dict[int, dict[str, TtsMeasurement]] = {
-        recording.target_tokens: {} for recording in recordings
-    }
-
-    print("Loading FasterQwen3TTS...", flush=True)
-    fast = faster_model(args)
-    warm_faster(args, fast)
+    recordings = build_recordings(args.targets, args.simulated_tokens_per_second)
+    recordings_dir = args.out_dir / "recordings"
+    recordings_dir.mkdir(parents=True, exist_ok=True)
     for recording in recordings:
-        target = recording.target_tokens
-        print(f"Faster target={target}: text-delta", flush=True)
-        audio, measurement = run_faster_text_delta(args, fast, recording)
-        measurements_by_target[target]["faster_text_delta"] = measurement
-        write_wav(args, target, measurement.label, audio, measurement.sample_rate)
+        (recordings_dir / f"prepared_{recording.target_tokens}.json").write_text(
+            json.dumps(recordings_to_json([recording])[0], indent=2) + "\n",
+            encoding="utf-8",
+        )
 
-        print(f"Faster target={target}: full-text", flush=True)
-        audio, measurement = run_faster_fulltext(args, fast, recording)
-        measurements_by_target[target]["faster_fulltext"] = measurement
-        write_wav(args, target, measurement.label, audio, measurement.sample_rate)
-    del fast
-    sync_device()
-    torch.cuda.empty_cache()
-
+    results = run_faster(config, recordings)
+    if not args.skip_qwen_streaming:
+        results["qwen_streaming_fulltext"] = run_worker(
+            "qwen_streaming", config, recordings, args.streaming_repo
+        )
     if not args.skip_vanilla:
-        print("Loading vanilla Qwen3TTSModel...", flush=True)
-        vanilla = vanilla_model(args)
-        warm_vanilla(args, vanilla)
-        for recording in recordings:
-            target = recording.target_tokens
-            if args.include_vanilla_text_delta:
-                print(f"Vanilla target={target}: text-delta", flush=True)
-                audio, measurement = run_vanilla_text_delta(args, vanilla, recording)
-                measurements_by_target[target]["vanilla_text_delta"] = measurement
-                write_wav(args, target, measurement.label, audio, measurement.sample_rate)
+        results["vanilla_fulltext"] = run_worker("vanilla", config, recordings, args.vanilla_repo)
 
-            print(f"Vanilla target={target}: full-text", flush=True)
-            audio, measurement = run_vanilla_fulltext(args, vanilla, recording)
-            measurements_by_target[target]["vanilla_fulltext"] = measurement
-            write_wav(args, target, measurement.label, audio, measurement.sample_rate)
-        del vanilla
-        sync_device()
-        torch.cuda.empty_cache()
-
-    for recording in recordings:
-        rows.append(build_summary_row(args, recording, measurements_by_target[recording.target_tokens]))
-
+    rows = build_rows(recordings, results)
     fieldnames = sorted({key for row in rows for key in row})
     with (args.out_dir / "summary_normalized.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -681,7 +706,7 @@ def main():
     table = markdown_tables(rows)
     (args.out_dir / "readme_tables.md").write_text(table, encoding="utf-8")
     print(table)
-    print(f"Wrote normalized benchmark output to {args.out_dir}", flush=True)
+    print(f"Wrote four-way benchmark output to {args.out_dir}", flush=True)
 
 
 if __name__ == "__main__":
