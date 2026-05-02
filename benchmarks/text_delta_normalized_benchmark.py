@@ -6,9 +6,12 @@ then replays the same text deltas with the same inter-delta timing into each
 TTS implementation. This keeps the LLM side identical while comparing:
 
 - vanilla Qwen3-TTS full-text input
-- vanilla Qwen3-TTS text-delta input, when available
 - FasterQwen3TTS full-text input
 - FasterQwen3TTS text-delta input
+
+It can optionally measure a patched vanilla Qwen3-TTS text-delta path when
+--include-vanilla-text-delta is passed, but that is not part of the default
+public comparison because stock vanilla Qwen3-TTS does not stream audio.
 
 Output is written under --out-dir, which is ignored by git.
 """
@@ -101,7 +104,7 @@ def parse_args():
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
     parser.add_argument("--out-dir", type=Path, default=Path("text_delta_normalized_benchmark"))
     parser.add_argument("--skip-vanilla", action="store_true")
-    parser.add_argument("--skip-vanilla-text-delta", action="store_true")
+    parser.add_argument("--include-vanilla-text-delta", action="store_true")
     parser.add_argument("--write-wavs", action="store_true")
     return parser.parse_args()
 
@@ -524,21 +527,20 @@ def markdown_tables(rows: list[dict]) -> str:
     lines = [
         "### Normalized LLM-to-TTS Timeline",
         "",
-        "All TTS timings are normalized to the first LLM text delta (`T+0.000s`). ",
+        "`T+0.000s` is the first LLM text delta. ",
         "🟩 means at least 1s saved, 🟨 means 0.25-1s saved, and ⬜ means under 0.25s saved.",
         "",
-        "| Target | LLM done | Vanilla full-text audio ready | Faster full-text first audio | Vanilla text-delta first audio | Faster text-delta first audio |",
-        "|---:|---:|---:|---:|---:|---:|",
+        "| Target | This repo: Faster + text-delta first audio | LLM done | Faster + full-text first audio | Vanilla Qwen full-text audio ready |",
+        "|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            "| {target} | {llm_done} | {vanilla_full} | {fast_full} | {vanilla_delta} | {fast_delta} |".format(
+            "| {target} | {fast_delta} | {llm_done} | {fast_full} | {vanilla_full} |".format(
                 target=f"{row['target_tokens']} tokens",
-                llm_done=tplus(_float(row.get("llm_done_after_first_token_s"))),
-                vanilla_full=tplus(_float(row.get("vanilla_fulltext_audio_ready_after_first_token_s"))),
-                fast_full=tplus(_float(row.get("faster_fulltext_first_audio_after_first_token_s"))),
-                vanilla_delta=tplus(_float(row.get("vanilla_text_delta_first_audio_after_first_token_s"))),
                 fast_delta=tplus(_float(row.get("faster_text_delta_first_audio_after_first_token_s"))),
+                llm_done=tplus(_float(row.get("llm_done_after_first_token_s"))),
+                fast_full=tplus(_float(row.get("faster_fulltext_first_audio_after_first_token_s"))),
+                vanilla_full=tplus(_float(row.get("vanilla_fulltext_audio_ready_after_first_token_s"))),
             )
         )
 
@@ -547,8 +549,8 @@ def markdown_tables(rows: list[dict]) -> str:
             "",
             "### Improvement Breakdown",
             "",
-            "| Target | Faster backend gain, full-text | Faster backend gain, text-delta | Front-side gain on Faster | Front-side gain on vanilla | Total gain: Faster text-delta vs vanilla full-text |",
-            "|---:|---:|---:|---:|---:|---:|",
+            "| Target | Backend gain: Faster full-text vs vanilla full-text | Front-side gain: Faster text-delta vs Faster full-text | Total gain: this repo vs vanilla full-text |",
+            "|---:|---:|---:|---:|",
         ]
     )
     for row in rows:
@@ -556,12 +558,10 @@ def markdown_tables(rows: list[dict]) -> str:
         fast_delta = _float(row.get("faster_text_delta_first_audio_after_first_token_s"))
         vanilla_full = _float(row.get("vanilla_fulltext_audio_ready_after_first_token_s"))
         lines.append(
-            "| {target} | {backend_full} | {backend_delta} | {front_fast} | {front_vanilla} | {total} ({ratio}) |".format(
+            "| {target} | {backend_full} | {front_fast} | {total} ({ratio}) |".format(
                 target=f"{row['target_tokens']} tokens",
                 backend_full=improvement(_float(row.get("faster_fulltext_backend_saved_vs_vanilla_fulltext_s"))),
-                backend_delta=improvement(_float(row.get("faster_text_delta_backend_saved_vs_vanilla_text_delta_s"))),
                 front_fast=improvement(_float(row.get("faster_frontside_saved_vs_fulltext_s"))),
-                front_vanilla=improvement(_float(row.get("vanilla_frontside_saved_vs_fulltext_s"))),
                 total=improvement(total),
                 ratio=ratio(fast_delta, vanilla_full),
             )
@@ -655,7 +655,7 @@ def main():
         warm_vanilla(args, vanilla)
         for recording in recordings:
             target = recording.target_tokens
-            if not args.skip_vanilla_text_delta:
+            if args.include_vanilla_text_delta:
                 print(f"Vanilla target={target}: text-delta", flush=True)
                 audio, measurement = run_vanilla_text_delta(args, vanilla, recording)
                 measurements_by_target[target]["vanilla_text_delta"] = measurement
