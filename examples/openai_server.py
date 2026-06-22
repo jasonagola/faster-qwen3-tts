@@ -44,6 +44,7 @@ import queue
 import struct
 import sys
 import threading
+import time
 from typing import AsyncGenerator, Optional
 
 import numpy as np
@@ -69,6 +70,14 @@ voices: dict = {}
 default_voice: Optional[str] = None
 SAMPLE_RATE = 24000  # updated once the model loads
 _model_lock = threading.Lock()  # prevent concurrent GPU inference
+TEXT_DELTA_IDLE_FILL_INTERVAL_SECONDS = float(
+    os.environ.get("QWEN_TTS_TEXT_DELTA_IDLE_FILL_INTERVAL_SECONDS", "0.08")
+)
+TEXT_DELTA_IDLE_FILL_MAX_SECONDS = float(
+    os.environ.get("QWEN_TTS_TEXT_DELTA_IDLE_FILL_MAX_SECONDS", "8.0")
+)
+TEXT_DELTA_IDLE_FILL_TEXT = os.environ.get("QWEN_TTS_TEXT_DELTA_IDLE_FILL_TEXT", " ")
+TEXT_DELTA_BASE_XVEC_ONLY = os.environ.get("QWEN_TTS_TEXT_DELTA_BASE_XVEC_ONLY", "1") != "0"
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -319,20 +328,36 @@ async def create_speech_from_deltas(websocket: WebSocket):
 
     def delta_iter():
         seen_text = False
-        idle_space_sent = False
+        idle_fill_started_at: float | None = None
+        stop_after_yield = False
         while True:
+            if stop_after_yield:
+                break
             try:
-                item = delta_queue.get(timeout=0.25)
+                item = delta_queue.get(timeout=TEXT_DELTA_IDLE_FILL_INTERVAL_SECONDS)
             except queue.Empty:
-                if seen_text and not idle_space_sent:
-                    idle_space_sent = True
-                    yield " "
+                if seen_text and TEXT_DELTA_IDLE_FILL_TEXT:
+                    now = time.monotonic()
+                    if idle_fill_started_at is None:
+                        idle_fill_started_at = now
+                    if (now - idle_fill_started_at) <= TEXT_DELTA_IDLE_FILL_MAX_SECONDS:
+                        yield TEXT_DELTA_IDLE_FILL_TEXT
                 continue
             if item is _DONE:
                 break
+            parts = [str(item)]
+            while True:
+                try:
+                    next_item = delta_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if next_item is _DONE:
+                    stop_after_yield = True
+                    break
+                parts.append(str(next_item))
             seen_text = True
-            idle_space_sent = False
-            yield str(item)
+            idle_fill_started_at = None
+            yield "".join(parts)
 
     def produce_audio():
         try:
@@ -344,6 +369,8 @@ async def create_speech_from_deltas(websocket: WebSocket):
                     ref_audio=voice_cfg["ref_audio"],
                     ref_text=voice_cfg.get("ref_text", ""),
                     chunk_size=voice_cfg.get("chunk_size", 12),
+                    xvec_only=TEXT_DELTA_BASE_XVEC_ONLY,
+                    append_silence=not TEXT_DELTA_BASE_XVEC_ONLY,
                 ):
                     audio_queue.put(chunk)
         except Exception as exc:

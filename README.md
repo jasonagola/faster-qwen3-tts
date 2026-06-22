@@ -150,6 +150,30 @@ curl http://localhost:8000/v1/audio/speech \
 
 To expose multiple voices, pass a JSON file mapping names to reference audio configs — each `voice` value in a request will be routed to the matching entry (`--voices voices.json`). WAV and PCM formats stream chunks as they are generated; MP3 requires `pydub`.
 
+The same server also exposes a WebSocket endpoint for LLM text-delta input streaming:
+
+```text
+ws://localhost:8000/v1/audio/speech/deltas
+```
+
+The client sends a JSON `start` message, then one or more text `delta` messages, then `done`. The server streams raw PCM binary messages back as soon as Qwen3-TTS can produce audio chunks, followed by a final JSON `{"type":"done"}` message. This endpoint is intended for voice agents that already receive token deltas from an LLM and should not wait for the full response before TTS starts.
+
+```json
+{"type":"start","voice":"alloy","response_format":"pcm","language":"English"}
+{"type":"delta","text":"The first part of the answer "}
+{"type":"delta","text":"arrived from the LLM."}
+{"type":"done"}
+```
+
+Tunable environment variables:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `QWEN_TTS_TEXT_DELTA_IDLE_FILL_INTERVAL_SECONDS` | `0.08` | How often the server yields idle filler while waiting for more text after generation has started. |
+| `QWEN_TTS_TEXT_DELTA_IDLE_FILL_MAX_SECONDS` | `8.0` | Maximum idle filler duration before waiting silently for more text. |
+| `QWEN_TTS_TEXT_DELTA_IDLE_FILL_TEXT` | space | Text fed during brief upstream LLM pauses so generation can keep moving. |
+| `QWEN_TTS_TEXT_DELTA_BASE_XVEC_ONLY` | `1` | Use the lower-latency x-vector voice clone path for Base models by default. |
+
 ## Results
 
 Benchmarks include tokenization + inference (apples-to-apples with baseline). RTF > 1.0 = faster than real-time. TTFA measured as time to first playable audio chunk using streaming (chunk_size=8).
@@ -283,6 +307,93 @@ python benchmarks/openai_text_delta_latency.py \
 ```
 
 This warms the TTS path first, then opens a fresh streamed OpenAI request for each engine/mode/token limit and feeds the deltas directly into the TTS generator as they arrive. The same completed text is then used for the full-text baseline, whose timeline starts only after the OpenAI stream finishes. Add `--no-tts-warmup` if you want first-use model setup and CUDA graph capture included in the request timing.
+
+### Normalized front-side streaming benchmark
+
+The normalized benchmark replays prepared LLM-style token deltas at a fixed rate and measures every TTS path from the first prepared text token:
+
+```text
+first prepared text token == T+0.000s
+```
+
+This removes live API variance and isolates the user-visible question: after the LLM starts answering, how long until audio is playable?
+
+Environment: NVIDIA GeForce RTX 5090 32GB, Ubuntu Linux, `Qwen/Qwen3-TTS-12Hz-0.6B-Base`, voice clone x-vector mode, prepared Wimbledon text, `o200k_base` tokenizer prefixes, simulated LLM rate 30 tokens/sec, `chunk_size=8`, `token_holdback` values `1` and `8`, `do_sample=True`, `temperature=0.9`, `top_k=50`, `top_p=1.0`, `repetition_penalty=1.05`, `max_new_tokens=4096`, dtype `bfloat16`, benchmark date `2026-05-02`. Model load and warmup are excluded.
+
+| Target | Text-delta hb=1 first audio | Text-delta hb=8 first audio | LLM done | Faster full-text first audio | Qwen3-TTS-streaming first audio | Vanilla Qwen full-text audio ready |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 tokens | T+0.358s | T+0.576s | T+3.300s | T+3.572s | T+3.754s | T+20.940s |
+| 200 tokens | T+0.341s | T+0.575s | T+6.633s | T+6.892s | T+7.081s | T+38.763s |
+| 500 tokens | T+0.348s | T+0.575s | T+16.633s | T+16.893s | T+17.065s | T+101.676s |
+
+In that run, text-delta first audio stayed around `T+0.34-0.36s` with `token_holdback=1` and around `T+0.58s` with `token_holdback=8`. Back-side audio streaming removes the wait for complete audio, CUDA graphs reduce full-text streaming overhead, and text-delta input streaming removes the front-side wait for the full LLM response.
+
+Reproduce:
+
+```bash
+git clone https://github.com/QwenLM/Qwen3-TTS.git ../Qwen3-TTS-vanilla
+git clone https://github.com/rekuenkdr/Qwen3-TTS-streaming.git ../Qwen3-TTS-streaming
+python -m pip install tiktoken
+
+python benchmarks/text_delta_normalized_benchmark.py \
+  --targets 100 200 500 \
+  --simulated-tokens-per-second 30 \
+  --delta-tokenizer openai-o200k \
+  --chunk-size 8 \
+  --token-holdback 1 \
+  --text-delta-token-holdbacks 1 8 \
+  --max-new-tokens 4096 \
+  --do-sample \
+  --vanilla-repo ../Qwen3-TTS-vanilla \
+  --streaming-repo ../Qwen3-TTS-streaming
+```
+
+The benchmark writes normalized CSV summaries, prepared text recordings, and README-ready Markdown tables under `text_delta_normalized_benchmark/`. Add `--write-wavs` to keep generated WAVs.
+
+### Text-delta validation
+
+Lightweight checks:
+
+```bash
+python3 -m py_compile \
+  faster_qwen3_tts/model.py \
+  faster_qwen3_tts/streaming.py \
+  faster_qwen3_tts/text_delta.py \
+  examples/openai_server.py \
+  benchmarks/compare_text_delta_input.py \
+  benchmarks/openai_text_delta_latency.py \
+  benchmarks/text_delta_normalized_benchmark.py \
+  benchmarks/text_delta_readme_benchmark.py
+
+python3 -m pytest \
+  tests/test_text_delta_helpers.py \
+  tests/test_text_delta_samples.py \
+  tests/test_voice_clone_prompt_api.py \
+  tests/test_sampling.py \
+  tests/test_sample_rate.py \
+  -q
+```
+
+Server smoke:
+
+```bash
+python examples/openai_server.py \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --device cuda \
+  --ref-audio ref_audio.wav \
+  --ref-text "Reference transcription" \
+  --language English
+
+curl http://localhost:8000/health
+curl http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"HTTP streaming smoke.","voice":"alloy","response_format":"pcm"}' \
+  --output /tmp/qwen3-tts-smoke.pcm
+```
+
+For the WebSocket smoke, send the `start`/`delta`/`done` protocol above and assert that at least one binary PCM message and a final JSON `done` are received. MRKS uses this path in `services/voice-worker/app/tts_client.py` through `stream_pcm_from_deltas(...)`.
 
 ## Voice Cloning Quality
 
