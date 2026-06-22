@@ -8,6 +8,7 @@ sample_*.wav
 __pycache__/
 *.pyc
 *.egg-info/
+.venv
 .venv/
 .env
 openai_live_torture*/
